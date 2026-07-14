@@ -61,7 +61,41 @@ def _cors_regex() -> Optional[str]:
         return None
     return "^(" + "|".join(parts) + ")$"
 
-app = FastAPI(title="AI Runtime Governance API")
+app = FastAPI(
+    title="MemoryGate Runtime Governance API",
+    version="0.2.0",
+    description=(
+        "Zero-trust runtime infrastructure for autonomous AI agents.\n\n"
+        "Every autonomous action from your agents is evaluated against **identity, policy,\n"
+        "context, and risk** — and returned as one of `allow` / `block` / `modify` /\n"
+        "`escalate`.\n\n"
+        "This is the same API served at `https://api.memorygate.dev` and consumed by the\n"
+        "`memorygate` Python SDK and `@memorygate/sdk` TypeScript SDK.\n\n"
+        "- **Auth**: JWT via `POST /api/auth/login` — send `Authorization: Bearer <token>` or\n"
+        "  rely on the `access_token` httpOnly cookie set by the login response.\n"
+        "- **Rate limits**: per-IP sliding window. `/api/evaluate` is the hot path (6000/min).\n"
+        "- **Public playground**: `/api/public/evaluate` needs no auth and hits a shared\n"
+        "  demo tenant. Rate-limited to 15 req/min per IP.\n"
+    ),
+    openapi_tags=[
+        {"name": "auth",       "description": "Register, login, current-user."},
+        {"name": "evaluate",   "description": "The hot path — evaluate one agent action."},
+        {"name": "public",     "description": "No-auth playground endpoints. Aggressively rate-limited."},
+        {"name": "agents",     "description": "Register and manage the AI agents that call `/evaluate`."},
+        {"name": "policies",   "description": "Ordered rules that decide the effect of an action. Versioned."},
+        {"name": "decisions",  "description": "Historical decisions and audit log."},
+        {"name": "escalations","description": "Human-in-the-loop queue."},
+        {"name": "analytics",  "description": "KPIs, timeline, mix, risk heatmap."},
+        {"name": "compliance", "description": "SOC 2 / ISO 27001 / GDPR / HIPAA reports and CSV export."},
+        {"name": "api-keys",   "description": "Programmatic credentials for SDK / server integrations."},
+        {"name": "webhooks",   "description": "Push decisions to Slack / Teams / PagerDuty / custom."},
+        {"name": "connectors", "description": "Postgres / Mongo / SurrealDB / Redis / Pinecone / Qdrant / REST."},
+        {"name": "members",    "description": "Multi-tenant org membership and RBAC."},
+    ],
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+)
 api = APIRouter(prefix="/api")
 
 logging.basicConfig(level=logging.INFO)
@@ -235,7 +269,7 @@ class EscalationDecisionIn(BaseModel):
 
 
 # ------------------------ auth ------------------------
-@api.post("/auth/register")
+@api.post("/auth/register", tags=["auth"], summary="Create a new organization and its first user")
 async def register(body: RegisterIn, request: Request, response: Response):
     email = body.email.lower()
     existing = await db.users.find_one({"email": email})
@@ -269,7 +303,7 @@ async def register(body: RegisterIn, request: Request, response: Response):
     return {"user": user_doc, "token": token}
 
 
-@api.post("/auth/login")
+@api.post("/auth/login", tags=["auth"], summary="Exchange email+password for an access token")
 async def login(body: LoginIn, request: Request, response: Response):
     email = body.email.lower()
     user = await db.users.find_one({"email": email})
@@ -596,7 +630,7 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-@api.post("/evaluate")
+@api.post("/evaluate", tags=["evaluate"], summary="Evaluate one agent action — the SDK hot path", response_description="A decision object with `evaluation_trace` explaining why the effect was chosen.")
 async def evaluate(body: EvaluateIn, request: Request, user=Depends(get_current_user)):
     return await _evaluate(
         user["org_id"], body,
@@ -778,6 +812,147 @@ async def simulate(request: Request, count: int = 10, user=Depends(get_current_u
         )
         made.append(await _evaluate(org_id, req, client_ip=ip, user_agent=ua))
     return {"created": len(made), "decisions": made}
+
+
+# ============================================================
+# Public playground — no auth, shared demo tenant, rate-limited
+# ============================================================
+PUBLIC_ORG_ID = "public_demo_org"
+
+PUBLIC_SCENARIOS = [
+    {
+        "id": "pii_read",
+        "title": "CRM copilot reads a customer",
+        "resource": "customers.read", "action": "read",
+        "purpose": "Sales rep asked to summarize account #42",
+        "payload": {"customer_id": 42, "include_email": True},
+        "expect": "modify",
+    },
+    {
+        "id": "prod_delete",
+        "title": "DevOps copilot deletes production",
+        "resource": "prod.deploy", "action": "delete",
+        "purpose": "cleanup old build",
+        "payload": {"target": "prod-us-east"},
+        "expect": "block",
+    },
+    {
+        "id": "billing_high_risk",
+        "title": "Finance agent transfers funds",
+        "resource": "billing.write", "action": "write",
+        "purpose": "wire $85,000 to vendor",
+        "payload": {"amount_usd": 85000, "vendor": "ACME"},
+        "expect": "escalate",
+    },
+    {
+        "id": "docs_public",
+        "title": "Support bot reads public docs",
+        "resource": "docs.public.read", "action": "read",
+        "purpose": "answer FAQ",
+        "payload": {"topic": "refunds"},
+        "expect": "allow",
+    },
+]
+
+
+async def _ensure_public_demo() -> str:
+    """Idempotently seed the public playground tenant with sample agents + policies."""
+    org = await db.orgs.find_one({"id": PUBLIC_ORG_ID})
+    if not org:
+        await db.orgs.insert_one({"id": PUBLIC_ORG_ID, "name": "MemoryGate Public Playground",
+                                  "created_at": now_utc().isoformat(),
+                                  "api_key": "sk_gov_public_readonly"})
+    if await db.agents.count_documents({"org_id": PUBLIC_ORG_ID}) == 0:
+        for a in [
+            {"name": "CRMCopilot",   "framework": "openai",    "trust_level": "medium",
+             "description": "Sales-side CRM copilot",  "capabilities": ["read_crm"]},
+            {"name": "DevOpsCopilot","framework": "anthropic", "trust_level": "low",
+             "description": "Runs deploys",             "capabilities": ["deploy"]},
+            {"name": "FinanceAssist","framework": "custom",    "trust_level": "medium",
+             "description": "Handles payouts",          "capabilities": ["write_billing"]},
+            {"name": "SupportBot",   "framework": "langchain", "trust_level": "high",
+             "description": "Answers public FAQs",      "capabilities": ["read_docs"]},
+        ]:
+            await db.agents.insert_one({**a, "id": new_id(), "org_id": PUBLIC_ORG_ID, "status": "active",
+                                        "risk_score": {"low": 15, "medium": 45, "high": 75}[a["trust_level"]],
+                                        "decisions_count": 0, "created_at": now_utc().isoformat()})
+    if await db.policies.count_documents({"org_id": PUBLIC_ORG_ID}) == 0:
+        for p in [
+            {"name": "Block deletions on production", "priority": 10, "subject": "*",
+             "resource_pattern": "prod.*", "action": "delete", "conditions": [],
+             "effect": "block", "description": "No agent may delete production resources."},
+            {"name": "Redact PII on customer reads", "priority": 20, "subject": "*",
+             "resource_pattern": "customers.*", "action": "read", "conditions": [],
+             "effect": "modify", "modify_instructions": "Strip email, phone, SSN.",
+             "description": "Enforce data protection by design."},
+            {"name": "Escalate high-risk writes", "priority": 30, "subject": "*",
+             "resource_pattern": "*", "action": "write",
+             "conditions": [{"field": "risk_score", "op": "gt", "value": 60}],
+             "effect": "escalate", "description": "Human-in-the-loop above the risk threshold."},
+            {"name": "Allow public docs", "priority": 40, "subject": "*",
+             "resource_pattern": "docs.public.*", "action": "read", "conditions": [],
+             "effect": "allow", "description": "Public documentation reads are always allowed."},
+        ]:
+            await db.policies.insert_one({**p, "id": new_id(), "org_id": PUBLIC_ORG_ID,
+                                          "enabled": True, "hits": 0, "version": 1,
+                                          "created_at": now_utc().isoformat()})
+    return PUBLIC_ORG_ID
+
+
+class PublicEvaluateIn(BaseModel):
+    scenario_id: Optional[str] = Field(default=None, max_length=40)
+    resource: Optional[str] = Field(default=None, max_length=200)
+    action: Optional[str] = Field(default=None, max_length=40)
+    purpose: Optional[str] = Field(default=None, max_length=500)
+    payload: Optional[Dict[str, Any]] = None
+    agent_name: Optional[str] = Field(default=None, max_length=40)  # CRMCopilot / DevOpsCopilot / ...
+
+
+@api.get("/public/scenarios", tags=["public"], summary="Canned playground scenarios and seeded agents/policies")
+async def public_scenarios():
+    await _ensure_public_demo()
+    agents = await db.agents.find({"org_id": PUBLIC_ORG_ID}, {"_id": 0, "id": 1, "name": 1,
+                                                                "trust_level": 1, "description": 1}).to_list(20)
+    policies = await db.policies.find({"org_id": PUBLIC_ORG_ID}, {"_id": 0}).sort("priority", 1).to_list(20)
+    return {"scenarios": PUBLIC_SCENARIOS, "agents": agents, "policies": policies}
+
+
+@api.post("/public/evaluate", tags=["public"], summary="No-auth public playground — hits a shared demo tenant")
+async def public_evaluate(body: PublicEvaluateIn, request: Request):
+    await _ensure_public_demo()
+    # pick scenario if referenced
+    scen = None
+    if body.scenario_id:
+        scen = next((s for s in PUBLIC_SCENARIOS if s["id"] == body.scenario_id), None)
+    resource = body.resource or (scen["resource"] if scen else "customers.read")
+    action = body.action or (scen["action"] if scen else "read")
+    purpose = body.purpose or (scen["purpose"] if scen else "")
+    payload = body.payload if body.payload is not None else (scen["payload"] if scen else {})
+    # pick agent by name (or first active)
+    agent = None
+    if body.agent_name:
+        agent = await db.agents.find_one({"org_id": PUBLIC_ORG_ID, "name": body.agent_name}, {"_id": 0})
+    if not agent:
+        agent = await db.agents.find_one({"org_id": PUBLIC_ORG_ID, "status": "active"}, {"_id": 0})
+    if not agent:
+        raise HTTPException(500, "Public demo not seeded")
+    req = EvaluateIn(agent_id=agent["id"], resource=resource, action=action,
+                     purpose=purpose, payload=payload,
+                     context={"source": "public_playground",
+                              "ip_hash": hashlib.sha256(_client_ip(request).encode()).hexdigest()[:12]})
+    return await _evaluate(PUBLIC_ORG_ID, req,
+                           client_ip=_client_ip(request),
+                           user_agent=request.headers.get("user-agent", "")[:200])
+
+
+@api.get("/public/decisions")
+async def public_decisions(limit: int = 12):
+    limit = max(1, min(50, limit))
+    items = await db.decisions.find({"org_id": PUBLIC_ORG_ID},
+                                    {"_id": 0, "payload": 0, "modified_payload": 0,
+                                     "context": 0, "client_ip": 0, "user_agent": 0}
+                                    ).sort("created_at", -1).limit(limit).to_list(limit)
+    return items
 
 
 # ============================================================
@@ -1499,6 +1674,7 @@ async def _csrf_guard(request: Request, call_next):
         not IS_DEV
         and request.method in _MUTATING_METHODS
         and request.url.path.startswith("/api/")
+        and not request.url.path.startswith("/api/public/")
     ):
         origin = request.headers.get("origin")
         auth = request.headers.get("authorization", "")
@@ -1517,8 +1693,9 @@ async def _csrf_guard(request: Request, call_next):
 # window_seconds, max_requests
 _RATE_RULES = [
     ("/api/auth/",   (60, 20)),
-    ("/api/evaluate", (60, 300)),
+    ("/api/evaluate", (60, 6000)),   # 100 req/s per IP — hot path
     ("/api/simulate", (60, 10)),
+    ("/api/public/",  (60, 15)),
 ]
 _RATE_DEFAULT = (60, 240)
 _rate_state: Dict[str, deque] = {}

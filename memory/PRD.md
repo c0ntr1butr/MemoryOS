@@ -25,7 +25,33 @@ User elaboration: framework-agnostic AI Runtime Governance Layer that sits betwe
 - Traffic simulator, seeded demo data (4 agents, 5 policies).
 - Production security stack: env-driven CORS allowlist + wildcard suffixes, Origin CSRF guard on mutations, in-process sliding-window rate limiter, security headers (`X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, `Strict-Transport-Security`), tight pydantic validation, structured JSON audit stream, client-IP + user-agent captured on every decision.
 
-### V2 / V3 — Enterprise platform (Jan 14, 2026)
+### V2 / V3 — Enterprise platform
+- Rebrand to **MemoryGate**, grouped sidebar.
+- **API keys** (rotate/revoke), **Webhooks** (Slack/Teams/PagerDuty/custom via real `httpx` delivery), **Connectors** (Postgres/Mongo/SurrealDB/Redis/Pinecone/Qdrant/REST), **Members** + full **RBAC** (owner/admin/editor/viewer) across every mutation, **Policy versioning + rollback**, **Compliance center** (SOC 2 / ISO 27001 / GDPR / HIPAA + CSV export), **Explainable AI decisions** (evaluation trace), **Real-time WebSocket** decision stream, **Risk heatmap**, **Interactive SDK docs**, **Runtime Architecture** page.
+- Verified: **58/58 pytest cases** (23 V1 + 35 V2).
+
+### V4 — Real infrastructure (Jan 14, 2026)
+- **Real `memorygate` Python SDK** — installable via `pip install -e ./sdks/python`. Sync `Client` + async `AsyncClient`, typed `Decision` model with `.allowed`, `.effective_payload`, `.trace`, `.to_exception()`. Includes `.guard()` helper that raises on non-allow decisions.
+  - Framework middleware in `memorygate.middleware.*`:
+    - **`langgraph.governed_node`** — wraps any LangGraph node so its state passes through MemoryGate first; blocks/escalates halt the graph.
+    - **`openai_agents.governed`** — walks an Agents-SDK `Agent`, wraps every tool's callable in place.
+    - **`crewai.GovernedCrew`** — drop-in `Crew` subclass that wraps every tool's `.run()` / `._run()`.
+    - **`google_adk.governed`** — wraps callables on Google ADK `LlmAgent.tools` / `.tool_registry`.
+    - **`mcp.MCPProxy`** — JSON-RPC proxy that governs every MCP `tools/call` before forwarding to the real MCP server. Also exposed as a CLI: `memorygate mcp-proxy --upstream ... --api-key ...`.
+  - Verified: **5/5 SDK unit tests** + a live end-to-end run through the local backend returning correct `modify` (with 5-step trace) and `block` decisions; `.guard()` correctly raised `PermissionDenied`.
+- **TypeScript SDK skeleton** (`@memorygate/sdk`) — `Decision` class, `MemoryGate` client, typed exceptions, ESM+CJS build config.
+- **Public no-signup playground** — new `/playground` route (outside auth wrapper) with:
+  - Hero + live decisions stream (public tenant, polled every 5 s).
+  - 4 canned scenarios (PII redact / prod delete / high-risk billing / public docs) with expected badges + one "compose your own" custom mode.
+  - Real `POST /api/public/evaluate` — no auth, seeded `public_demo_org` tenant with 4 agents + 4 policies, rate-limited to **15 req/min per IP**, CSRF-exempt.
+  - SDK section with Python + TypeScript snippets and install commands for every framework extra.
+  - Footer CTA: "Open console" / "Book an enterprise pilot".
+- **Latency & throughput benchmark** (`benchmarks/bench.py` + `benchmarks/README.md`):
+  - Single-caller: **p50 = 47 ms**, throughput 22 req/s.
+  - 16-way concurrency: 159 req/s, p50 98 ms, p99 149 ms.
+  - 32-way stress: 133 req/s, p50 242 ms, p99 370 ms.
+- **OpenAPI polish**: 13 tags, per-endpoint summaries, description block. Swagger UI at `/api/docs`, ReDoc at `/api/redoc`, spec at `/api/openapi.json`.
+- **Rate-limit tuning**: bumped `/api/evaluate` to 6 000 req/min (100 rps) per IP so the SDK can actually be used at production throughput.
 - **Rebrand** to *MemoryGate*, grouped sidebar (Security / Policy / Agents & Access / Integrations / Observability / System).
 - **API keys**: `POST /api-keys` returns secret once, `rotate`, `revoke`, hashed at rest (sha256), prefix + suffix display. Admin+ role required.
 - **Webhooks**: Slack / Teams / PagerDuty / custom endpoints, per-event filters, real `httpx` delivery via `asyncio.create_task`, `POST /webhooks/{id}/test`, delivery counters + last status persisted.
@@ -44,11 +70,11 @@ User elaboration: framework-agnostic AI Runtime Governance Layer that sits betwe
 - **Frontend**: all 15 sidebar routes render, SDKs playground returns real decisions, Compliance framework switching + CSV export work, Runtime shows real WebSocket "ws live" badge + evaluation trace drawer, Analytics heatmap renders with live data.
 
 ## Roadmap
-- ✅ **V1**: Runtime governance platform (done, 23/23 tests, hardened)
-- ✅ **V2**: SDKs + integrations (done, Python / TS / LangGraph / OpenAI Agents / CrewAI / MCP examples, connectors, webhooks, WebSocket, API keys)
-- ✅ **V3**: Visual policy builder + compliance (done — SOC 2 / ISO 27001 / GDPR / HIPAA, policy versioning + rollback, explainability trace)
-- 🚀 **V4**: Real integrations with LangGraph, OpenAI Agents SDK, CrewAI, MCP — ship an actual `pip install memorygate` package with runnable middleware. Publish an MCP proxy binary.
-- 🚀 **V5**: Pilot with an enterprise — after V4, **stop building UI**. Talk to security engineers. Real feedback from three enterprise teams > another dashboard page.
+- ✅ **V1**: Runtime governance platform (23/23 tests, hardened)
+- ✅ **V2**: SDKs + integrations (dashboard side)
+- ✅ **V3**: Visual policy builder + compliance
+- ✅ **V4**: Real `pip install memorygate` SDK with 5 middleware modules + public no-signup playground + benchmarks + OpenAPI docs
+- 🚀 **V5**: **Pilot with 3 enterprise teams.** Stop building UI. Talk to security engineers, CTOs, and AI platform leads. Turn feedback into a pricing sheet and an actual SLA.
 
 ## Prioritized backlog (deferred, non-blocking)
 - Split `server.py` into `routers/*.py` (auth, agents, policies, evaluate, analytics, api_keys, webhooks, connectors, members, versions, compliance, heatmap, ws) — it's ~1600 lines now.

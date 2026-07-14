@@ -19,6 +19,7 @@ import Members from "@/pages/Members";
 import Compliance from "@/pages/Compliance";
 import SDKs from "@/pages/SDKs";
 import Architecture from "@/pages/Architecture";
+import Playground from "@/pages/Playground";
 
 function Protected({ children }) {
   const { user } = useAuth();
@@ -49,6 +50,7 @@ function App() {
             }}
           />
           <Routes>
+            <Route path="/playground" element={<Playground />} />
             <Route path="/auth" element={<AuthPage />} />
             <Route
               path="/"

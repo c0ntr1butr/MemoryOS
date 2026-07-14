@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memorygate"
+version = "0.1.0"
+description = "Runtime governance for autonomous AI agents. Framework-agnostic middleware that evaluates every agent action against identity, policy, context, and risk before it reaches your enterprise systems."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [{name = "MemoryGate", email = "hello@memorygate.dev"}]
+keywords = ["ai", "governance", "agents", "security", "zero-trust", "langgraph", "crewai", "mcp"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Information Technology",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+  "httpx>=0.27",
+  "typing-extensions>=4.7",
+]
+
+[project.optional-dependencies]
+langgraph = ["langgraph>=0.2"]
+openai   = ["openai-agents>=0.0.6"]
+crewai   = ["crewai>=0.60"]
+google   = ["google-adk>=0.2"]
+mcp      = ["mcp>=1.0"]
+dev      = ["pytest", "pytest-asyncio", "ruff"]
+all      = ["langgraph>=0.2", "openai-agents>=0.0.6", "crewai>=0.60", "google-adk>=0.2", "mcp>=1.0"]
+
+[project.urls]
+Homepage      = "https://memorygate.dev"
+Documentation = "https://docs.memorygate.dev"
+Repository    = "https://github.com/memorygate/memorygate-python"
+Issues        = "https://github.com/memorygate/memorygate-python/issues"
+
+[project.scripts]
+memorygate = "memorygate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["memorygate*"]
