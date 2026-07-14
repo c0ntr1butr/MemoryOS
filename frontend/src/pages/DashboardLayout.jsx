@@ -24,46 +24,46 @@ const sections = [
   {
     label: "Security",
     items: [
-      { to: "/", label: "Overview", icon: LayoutDashboard, end: true, tid: "nav-overview" },
-      { to: "/runtime", label: "Runtime", icon: Activity, tid: "nav-runtime" },
-      { to: "/escalations", label: "Escalations", icon: AlertTriangle, tid: "nav-escalations" },
+      { to: "/console", label: "Overview", icon: LayoutDashboard, end: true, tid: "nav-overview" },
+      { to: "/console/runtime", label: "Runtime", icon: Activity, tid: "nav-runtime" },
+      { to: "/console/escalations", label: "Escalations", icon: AlertTriangle, tid: "nav-escalations" },
     ],
   },
   {
     label: "Policy",
     items: [
-      { to: "/policies", label: "Policies", icon: ScrollText, tid: "nav-policies" },
-      { to: "/compliance", label: "Compliance", icon: ShieldCheck, tid: "nav-compliance" },
+      { to: "/console/policies", label: "Policies", icon: ScrollText, tid: "nav-policies" },
+      { to: "/console/compliance", label: "Compliance", icon: ShieldCheck, tid: "nav-compliance" },
     ],
   },
   {
     label: "Agents & Access",
     items: [
-      { to: "/agents", label: "Agents", icon: Bot, tid: "nav-agents" },
-      { to: "/keys", label: "API keys", icon: KeyRound, tid: "nav-keys" },
-      { to: "/members", label: "Members", icon: Users, tid: "nav-members" },
+      { to: "/console/agents", label: "Agents", icon: Bot, tid: "nav-agents" },
+      { to: "/console/keys", label: "API keys", icon: KeyRound, tid: "nav-keys" },
+      { to: "/console/members", label: "Members", icon: Users, tid: "nav-members" },
     ],
   },
   {
     label: "Integrations",
     items: [
-      { to: "/connectors", label: "Connectors", icon: Plug, tid: "nav-connectors" },
-      { to: "/webhooks", label: "Webhooks", icon: Webhook, tid: "nav-webhooks" },
-      { to: "/sdks", label: "SDKs & Docs", icon: Code2, tid: "nav-sdks" },
+      { to: "/console/connectors", label: "Connectors", icon: Plug, tid: "nav-connectors" },
+      { to: "/console/webhooks", label: "Webhooks", icon: Webhook, tid: "nav-webhooks" },
+      { to: "/console/sdks", label: "SDKs & Docs", icon: Code2, tid: "nav-sdks" },
     ],
   },
   {
     label: "Observability",
     items: [
-      { to: "/audit", label: "Audit logs", icon: Search, tid: "nav-audit" },
-      { to: "/analytics", label: "Analytics", icon: BarChart3, tid: "nav-analytics" },
+      { to: "/console/audit", label: "Audit logs", icon: Search, tid: "nav-audit" },
+      { to: "/console/analytics", label: "Analytics", icon: BarChart3, tid: "nav-analytics" },
     ],
   },
   {
     label: "System",
     items: [
-      { to: "/architecture", label: "Architecture", icon: Network, tid: "nav-architecture" },
-      { to: "/settings", label: "Settings", icon: Cog, tid: "nav-settings" },
+      { to: "/console/architecture", label: "Architecture", icon: Network, tid: "nav-architecture" },
+      { to: "/console/settings", label: "Settings", icon: Cog, tid: "nav-settings" },
     ],
   },
 ];

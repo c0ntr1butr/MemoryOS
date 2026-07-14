@@ -955,6 +955,65 @@ async def public_decisions(limit: int = 12):
     return items
 
 
+# ---------- Public lead capture (Book a pilot) ----------
+class LeadIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    email: EmailStr
+    company: str = Field(min_length=1, max_length=120)
+    role: str = Field(default="", max_length=80)
+    team_size: str = Field(default="", max_length=40)
+    agent_count: str = Field(default="", max_length=40)
+    frameworks: List[str] = Field(default_factory=list, max_length=12)
+    timeline: str = Field(default="", max_length=40)
+    message: str = Field(default="", max_length=2000)
+    source: str = Field(default="pilot", max_length=40)  # pilot / pricing / demo / contact
+
+
+@api.post("/public/leads", tags=["public"], summary="Book-a-pilot / demo-request lead capture")
+async def create_lead(body: LeadIn, request: Request):
+    doc = {
+        **body.model_dump(),
+        "id": new_id(),
+        "created_at": now_utc().isoformat(),
+        "client_ip": _client_ip(request),
+        "user_agent": request.headers.get("user-agent", "")[:200],
+        "status": "new",
+    }
+    await db.leads.insert_one(doc)
+    audit_log("lead.new", email=body.email.lower(), company=body.company,
+              source=body.source, ip=doc["client_ip"])
+    # Fire the same webhook fan-out we use for decisions — teams may want a Slack ping.
+    asyncio.create_task(_notify_lead(doc))
+    doc.pop("_id", None)
+    return {"ok": True, "id": doc["id"]}
+
+
+async def _notify_lead(lead: dict) -> None:
+    """Deliver 'new pilot request' events to every webhook configured on the
+    seeded admin's org — this is the closest thing we have to a CRM sink in
+    the preview. Real deployments would push to Salesforce / HubSpot here."""
+    try:
+        admin = await db.users.find_one({"role": "owner", "email": os.environ.get("ADMIN_EMAIL", "").lower()})
+        if not admin:
+            return
+        hooks = await db.webhooks.find({"org_id": admin["org_id"], "enabled": True}, {"_id": 0}).to_list(20)
+        summary = (f"🚀 New MemoryGate pilot request: *{lead['company']}* — "
+                   f"{lead['name']} <{lead['email']}> — team {lead.get('team_size', '?')} "
+                   f"agents {lead.get('agent_count', '?')} timeline {lead.get('timeline', '?')}")
+        for wh in hooks:
+            body = ({"text": summary} if wh["kind"] == "slack"
+                    else {"event": "lead.new", "lead": lead})
+            await _post_webhook(wh, body)
+    except Exception:
+        logger.exception("_notify_lead failed")
+
+
+@api.get("/leads", tags=["public"], summary="List captured leads (admin only)")
+async def list_leads(user=Depends(require_role("admin")), limit: int = 100):
+    items = await db.leads.find({}, {"_id": 0}).sort("created_at", -1).limit(min(200, limit)).to_list(200)
+    return items
+
+
 # ============================================================
 # V2 — API keys, webhooks, connectors, members/RBAC,
 # policy versions/rollback, compliance, heatmap, WebSocket

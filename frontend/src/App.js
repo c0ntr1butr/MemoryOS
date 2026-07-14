@@ -20,6 +20,15 @@ import Compliance from "@/pages/Compliance";
 import SDKs from "@/pages/SDKs";
 import Architecture from "@/pages/Architecture";
 import Playground from "@/pages/Playground";
+// Public marketing pages
+import Home from "@/pages/public/Home";
+import Product from "@/pages/public/Product";
+import Pricing from "@/pages/public/Pricing";
+import Docs from "@/pages/public/Docs";
+import Security from "@/pages/public/Security";
+import Customers from "@/pages/public/Customers";
+import Benchmarks from "@/pages/public/Benchmarks";
+import Pilot, { PilotThanks } from "@/pages/public/Pilot";
 
 function Protected({ children }) {
   const { user } = useAuth();
@@ -50,10 +59,24 @@ function App() {
             }}
           />
           <Routes>
+            {/* Public marketing site */}
+            <Route path="/" element={<Home />} />
+            <Route path="/product" element={<Product />} />
+            <Route path="/pricing" element={<Pricing />} />
+            <Route path="/docs" element={<Docs />} />
+            <Route path="/security" element={<Security />} />
+            <Route path="/customers" element={<Customers />} />
+            <Route path="/benchmarks" element={<Benchmarks />} />
+            <Route path="/pilot" element={<Pilot />} />
+            <Route path="/pilot/thanks" element={<PilotThanks />} />
             <Route path="/playground" element={<Playground />} />
+
+            {/* Auth */}
             <Route path="/auth" element={<AuthPage />} />
+
+            {/* Dashboard (protected) */}
             <Route
-              path="/"
+              path="/console"
               element={
                 <Protected>
                   <DashboardLayout />
@@ -76,6 +99,7 @@ function App() {
               <Route path="architecture" element={<Architecture />} />
               <Route path="settings" element={<Settings />} />
             </Route>
+
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </BrowserRouter>

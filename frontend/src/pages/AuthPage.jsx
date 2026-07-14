@@ -17,7 +17,7 @@ export default function AuthPage() {
   });
 
   useEffect(() => {
-    if (user && user.email) navigate("/", { replace: true });
+    if (user && user.email) navigate("/console", { replace: true });
   }, [user, navigate]);
 
   const onSubmit = async (e) => {
@@ -31,7 +31,7 @@ export default function AuthPage() {
         await register(form);
         toast.success("Organization created");
       }
-      navigate("/");
+      navigate("/console");
     } catch (err) {
       toast.error(formatErr(err.response?.data?.detail) || "Failed");
     } finally {
