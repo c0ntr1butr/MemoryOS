@@ -4,14 +4,18 @@ load_dotenv()
 
 import os
 import re
+import json
+import time
 import uuid
 import jwt
 import bcrypt
 import random
 import logging
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any, Literal
 from fastapi import FastAPI, APIRouter, Request, Response, HTTPException, Depends, Query
+from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
@@ -25,11 +29,57 @@ db = client[db_name]
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGO = "HS256"
 
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "development").lower()
+IS_DEV = ENVIRONMENT == "development"
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "").strip()
+ALLOWED_ORIGINS: List[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+# Wildcard suffixes (e.g. ".preview.emergentagent.com") allow any subdomain.
+_raw_suffixes = os.environ.get("ALLOWED_ORIGIN_SUFFIXES", "").strip()
+ALLOWED_ORIGIN_SUFFIXES: List[str] = [s.strip() for s in _raw_suffixes.split(",") if s.strip()]
+
+
+def _origin_allowed(origin: str) -> bool:
+    if origin in ALLOWED_ORIGINS:
+        return True
+    for suffix in ALLOWED_ORIGIN_SUFFIXES:
+        if origin.endswith(suffix):
+            return True
+    return False
+
+
+# Build a CORS regex that matches explicit origins + suffix wildcards.
+def _cors_regex() -> Optional[str]:
+    parts = [re.escape(o) for o in ALLOWED_ORIGINS]
+    for s in ALLOWED_ORIGIN_SUFFIXES:
+        parts.append(r"https?://[^/]+" + re.escape(s))
+    if not parts:
+        return None
+    return "^(" + "|".join(parts) + ")$"
+
 app = FastAPI(title="AI Runtime Governance API")
 api = APIRouter(prefix="/api")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("governance")
+
+# Structured audit logger — one JSON line per event, dedicated stream.
+audit_logger = logging.getLogger("audit")
+if not audit_logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(message)s"))
+    audit_logger.addHandler(_h)
+audit_logger.setLevel(logging.INFO)
+audit_logger.propagate = False
+
+
+def audit_log(event: str, **fields: Any) -> None:
+    """Emit one structured JSON line for audit consumers (SIEM/ELK)."""
+    payload = {"ts": now_utc().isoformat(), "event": event, "env": ENVIRONMENT, **fields}
+    try:
+        audit_logger.info(json.dumps(payload, default=str, separators=(",", ":")))
+    except Exception:
+        # audit logging must never break request handling
+        logger.exception("audit_log serialization failed")
 
 
 # ------------------------ helpers ------------------------
@@ -102,66 +152,71 @@ async def get_current_user(request: Request) -> dict:
 
 
 # ------------------------ models ------------------------
+_NAME_RE = r"^[A-Za-z0-9 _.\-]{1,80}$"
+_PATTERN_RE = r"^[A-Za-z0-9_.\-\*]{1,120}$"
+
+
 class RegisterIn(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=6)
+    password: str = Field(min_length=8, max_length=128)
     name: str = Field(min_length=1, max_length=80)
     org_name: str = Field(min_length=1, max_length=80)
 
 
 class LoginIn(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(min_length=1, max_length=128)
 
 
 class AgentIn(BaseModel):
-    name: str
-    description: Optional[str] = ""
-    framework: str = "custom"  # openai, langchain, anthropic, custom, ...
-    capabilities: List[str] = []
+    name: str = Field(min_length=1, max_length=80, pattern=_NAME_RE)
+    description: Optional[str] = Field(default="", max_length=500)
+    framework: str = Field(default="custom", max_length=40)
+    capabilities: List[str] = Field(default_factory=list, max_length=32)
     trust_level: Literal["low", "medium", "high"] = "medium"
     status: Literal["active", "paused", "revoked"] = "active"
 
 
 class PolicyCondition(BaseModel):
-    field: str  # resource, purpose, agent_trust, risk_score, action
+    field: str = Field(max_length=40)
     op: Literal["equals", "not_equals", "contains", "gt", "lt", "in", "not_in"]
     value: Any
 
 
 class PolicyIn(BaseModel):
-    name: str
-    description: Optional[str] = ""
-    priority: int = 100  # lower = higher priority
-    subject: str = "*"  # agent id or "*"
-    resource_pattern: str = "*"  # e.g. "customers.*" or "billing.write"
-    action: str = "*"  # read, write, delete, execute, *
-    conditions: List[PolicyCondition] = []
+    name: str = Field(min_length=1, max_length=120, pattern=_NAME_RE)
+    description: Optional[str] = Field(default="", max_length=500)
+    priority: int = Field(default=100, ge=0, le=10000)
+    subject: str = Field(default="*", max_length=64)
+    resource_pattern: str = Field(default="*", max_length=120, pattern=_PATTERN_RE)
+    action: str = Field(default="*", max_length=40)
+    conditions: List[PolicyCondition] = Field(default_factory=list, max_length=32)
     effect: Literal["allow", "block", "modify", "escalate"] = "allow"
-    modify_instructions: Optional[str] = None
+    modify_instructions: Optional[str] = Field(default=None, max_length=500)
     enabled: bool = True
 
 
 class EvaluateIn(BaseModel):
-    agent_id: str
-    resource: str
-    action: str = "read"
-    purpose: Optional[str] = ""
-    context: Dict[str, Any] = {}
-    payload: Dict[str, Any] = {}
+    agent_id: str = Field(min_length=1, max_length=64)
+    resource: str = Field(min_length=1, max_length=200)
+    action: str = Field(default="read", max_length=40)
+    purpose: Optional[str] = Field(default="", max_length=500)
+    context: Dict[str, Any] = Field(default_factory=dict)
+    payload: Dict[str, Any] = Field(default_factory=dict)
 
 
 class EscalationDecisionIn(BaseModel):
     approve: bool
-    note: Optional[str] = ""
+    note: Optional[str] = Field(default="", max_length=500)
 
 
 # ------------------------ auth ------------------------
 @api.post("/auth/register")
-async def register(body: RegisterIn, response: Response):
+async def register(body: RegisterIn, request: Request, response: Response):
     email = body.email.lower()
     existing = await db.users.find_one({"email": email})
     if existing:
+        audit_log("auth.register.rejected", email=email, ip=_client_ip(request), reason="duplicate")
         raise HTTPException(status_code=400, detail="Email already registered")
     org_id = new_id()
     user_id = new_id()
@@ -184,27 +239,31 @@ async def register(body: RegisterIn, response: Response):
     await db.users.insert_one(user_doc)
     token = create_access_token(user_id, email, org_id)
     set_auth_cookie(response, token)
+    audit_log("auth.register", user_id=user_id, org_id=org_id, email=email, ip=_client_ip(request))
     user_doc.pop("password_hash", None)
     user_doc.pop("_id", None)
     return {"user": user_doc, "token": token}
 
 
 @api.post("/auth/login")
-async def login(body: LoginIn, response: Response):
+async def login(body: LoginIn, request: Request, response: Response):
     email = body.email.lower()
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(body.password, user["password_hash"]):
+        audit_log("auth.login.failed", email=email, ip=_client_ip(request))
         raise HTTPException(status_code=401, detail="Invalid email or password")
     token = create_access_token(user["id"], user["email"], user["org_id"])
     set_auth_cookie(response, token)
+    audit_log("auth.login", user_id=user["id"], org_id=user["org_id"], email=email, ip=_client_ip(request))
     user.pop("_id", None)
     user.pop("password_hash", None)
     return {"user": user, "token": token}
 
 
 @api.post("/auth/logout")
-async def logout(response: Response):
+async def logout(request: Request, response: Response):
     clear_auth_cookie(response)
+    audit_log("auth.logout", ip=_client_ip(request))
     return {"ok": True}
 
 
@@ -350,7 +409,9 @@ def _compute_risk(agent: dict, req: EvaluateIn) -> int:
 
 async def _log_decision(org_id: str, agent: dict, req: EvaluateIn, decision: str,
                         matched_policy: Optional[dict], risk: int,
-                        modified_payload: Optional[dict], reason: str) -> dict:
+                        modified_payload: Optional[dict], reason: str,
+                        client_ip: Optional[str] = None,
+                        user_agent: Optional[str] = None) -> dict:
     entry = {
         "id": new_id(),
         "org_id": org_id,
@@ -367,6 +428,8 @@ async def _log_decision(org_id: str, agent: dict, req: EvaluateIn, decision: str
         "context": req.context,
         "payload": req.payload,
         "modified_payload": modified_payload,
+        "client_ip": client_ip,
+        "user_agent": user_agent,
         "created_at": now_utc().isoformat(),
     }
     await db.decisions.insert_one(entry.copy())
@@ -388,18 +451,33 @@ async def _log_decision(org_id: str, agent: dict, req: EvaluateIn, decision: str
             "status": "pending",
             "created_at": now_utc().isoformat(),
         })
+    # structured audit trail — one JSON line per decision
+    audit_log(
+        "decision",
+        decision_id=entry["id"],
+        org_id=org_id,
+        agent_id=agent["id"],
+        resource=req.resource,
+        action=req.action,
+        decision=decision,
+        risk_score=risk,
+        policy_id=entry["policy_id"],
+        client_ip=client_ip,
+    )
     entry.pop("_id", None)
     return entry
 
 
-async def _evaluate(org_id: str, req: EvaluateIn) -> dict:
+async def _evaluate(org_id: str, req: EvaluateIn,
+                    client_ip: Optional[str] = None,
+                    user_agent: Optional[str] = None) -> dict:
     agent = await db.agents.find_one({"id": req.agent_id, "org_id": org_id}, {"_id": 0})
     if not agent:
         raise HTTPException(404, "Unknown agent")
     if agent.get("status") != "active":
-        entry = await _log_decision(org_id, agent, req, "block", None, 100, None,
-                                    f"Agent status is {agent.get('status')}")
-        return entry
+        return await _log_decision(org_id, agent, req, "block", None, 100, None,
+                                   f"Agent status is {agent.get('status')}",
+                                   client_ip, user_agent)
     risk = _compute_risk(agent, req)
     ctx = {
         "resource": req.resource,
@@ -428,19 +506,33 @@ async def _evaluate(org_id: str, req: EvaluateIn) -> dict:
         if p["effect"] == "modify":
             modified = {**req.payload, "_governance": {"redacted_fields": ["email", "phone", "ssn"],
                                                         "notes": p.get("modify_instructions") or "PII stripped"}}
-        return await _log_decision(org_id, agent, req, p["effect"], p, risk, modified, reason)
+        return await _log_decision(org_id, agent, req, p["effect"], p, risk, modified, reason,
+                                   client_ip, user_agent)
 
     # default: escalate if high risk, else allow
     if risk >= 70:
         return await _log_decision(org_id, agent, req, "escalate", None, risk, None,
-                                   f"No policy matched and risk {risk} ≥ 70")
+                                   f"No policy matched and risk {risk} ≥ 70",
+                                   client_ip, user_agent)
     return await _log_decision(org_id, agent, req, "allow", None, risk, None,
-                               "No policy matched, low risk — default allow")
+                               "No policy matched, low risk — default allow",
+                               client_ip, user_agent)
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if fwd:
+        return fwd
+    return request.client.host if request.client else "unknown"
 
 
 @api.post("/evaluate")
-async def evaluate(body: EvaluateIn, user=Depends(get_current_user)):
-    return await _evaluate(user["org_id"], body)
+async def evaluate(body: EvaluateIn, request: Request, user=Depends(get_current_user)):
+    return await _evaluate(
+        user["org_id"], body,
+        client_ip=_client_ip(request),
+        user_agent=request.headers.get("user-agent", "")[:200],
+    )
 
 
 # ------------------------ decisions / audit ------------------------
@@ -595,12 +687,14 @@ SIM_PURPOSES = [
 
 
 @api.post("/simulate")
-async def simulate(count: int = 10, user=Depends(get_current_user)):
+async def simulate(request: Request, count: int = 10, user=Depends(get_current_user)):
     org_id = user["org_id"]
     agents = await db.agents.find({"org_id": org_id, "status": "active"}, {"_id": 0}).to_list(50)
     if not agents:
         raise HTTPException(400, "Create at least one active agent first")
     count = max(1, min(50, int(count)))
+    ip = _client_ip(request)
+    ua = request.headers.get("user-agent", "")[:200]
     made = []
     for _ in range(count):
         a = random.choice(agents)
@@ -612,7 +706,7 @@ async def simulate(count: int = 10, user=Depends(get_current_user)):
             context={"source": "simulator", "ip": f"10.0.{random.randint(0,255)}.{random.randint(0,255)}"},
             payload={"demo": True},
         )
-        made.append(await _evaluate(org_id, req))
+        made.append(await _evaluate(org_id, req, client_ip=ip, user_agent=ua))
     return {"created": len(made), "decisions": made}
 
 
@@ -726,10 +820,117 @@ async def _shutdown():
 
 app.include_router(api)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origin_regex=".*",
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ============================================================
+# Security middleware stack (executed in reverse-registration order):
+#   1) CORS               — first-line origin control
+#   2) Security headers   — added to every response
+#   3) Origin CSRF check  — reject cross-origin mutations in prod
+#   4) Rate limiter       — per-IP sliding window per route class
+# ============================================================
+
+# ---- 1) CORS ----
+if IS_DEV:
+    # Permissive during local dev only.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=".*",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    if not ALLOWED_ORIGINS and not ALLOWED_ORIGIN_SUFFIXES:
+        logger.warning("ALLOWED_ORIGINS/ALLOWED_ORIGIN_SUFFIXES are empty in non-dev env; refusing all cross-origin requests")
+    _regex = _cors_regex()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=_regex or r"^$",  # match nothing if not configured
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+        max_age=600,
+    )
+
+
+# ---- 2) Security headers ----
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    )
+    if not IS_DEV:
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    return response
+
+
+# ---- 3) Origin-based CSRF guard for cookie-authenticated mutations ----
+_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+@app.middleware("http")
+async def _csrf_guard(request: Request, call_next):
+    # Only guard /api mutations. Same-origin browser POSTs always include an Origin
+    # header; SDK / server-to-server callers use Authorization: Bearer (not cookies)
+    # and are exempt because a cross-site attacker cannot forge that header.
+    if (
+        not IS_DEV
+        and request.method in _MUTATING_METHODS
+        and request.url.path.startswith("/api/")
+    ):
+        origin = request.headers.get("origin")
+        auth = request.headers.get("authorization", "")
+        if origin and not _origin_allowed(origin) and not auth.startswith("Bearer "):
+            audit_log(
+                "csrf.blocked",
+                origin=origin,
+                path=request.url.path,
+                ip=_client_ip(request),
+            )
+            return JSONResponse({"detail": "Origin not allowed"}, status_code=403)
+    return await call_next(request)
+
+
+# ---- 4) Rate limiter (in-process sliding window) ----
+# window_seconds, max_requests
+_RATE_RULES = [
+    ("/api/auth/",   (60, 20)),
+    ("/api/evaluate", (60, 300)),
+    ("/api/simulate", (60, 10)),
+]
+_RATE_DEFAULT = (60, 240)
+_rate_state: Dict[str, deque] = {}
+
+
+def _rate_bucket(path: str):
+    for prefix, cfg in _RATE_RULES:
+        if path.startswith(prefix):
+            return prefix, cfg
+    return "default", _RATE_DEFAULT
+
+
+@app.middleware("http")
+async def _rate_limit(request: Request, call_next):
+    path = request.url.path
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    bucket, (window, limit) = _rate_bucket(path)
+    key = f"{bucket}:{_client_ip(request)}"
+    now = time.time()
+    q = _rate_state.setdefault(key, deque())
+    while q and now - q[0] > window:
+        q.popleft()
+    if len(q) >= limit:
+        audit_log("ratelimit.blocked", bucket=bucket, ip=_client_ip(request), path=path)
+        return JSONResponse(
+            {"detail": "Too many requests"},
+            status_code=429,
+            headers={"Retry-After": str(window)},
+        )
+    q.append(now)
+    return await call_next(request)
