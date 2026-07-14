@@ -1,0 +1,102 @@
+{
+  "theme": "dark-first",
+  "typography": {
+    "headings": {
+      "family": "Outfit, sans-serif",
+      "weights": ["400", "500", "600"],
+      "usage": "Use tight tracking (tracking-tight) for H1/H2."
+    },
+    "body": {
+      "family": "Manrope, sans-serif",
+      "weights": ["400", "500", "600"],
+      "usage": "Clean, highly legible for dense data arrays."
+    },
+    "mono": {
+      "family": "IBM Plex Mono, monospace",
+      "weights": ["400", "500"],
+      "usage": "Crucial for JSON payloads, policy rules, agent IDs, and audit logs."
+    }
+  },
+  "colors": {
+    "background": {
+      "base": "#0A0A0A",
+      "surface_100": "#111111",
+      "surface_200": "#1A1A1A"
+    },
+    "border": {
+      "default": "rgba(255, 255, 255, 0.1)",
+      "hover": "rgba(255, 255, 255, 0.2)"
+    },
+    "text": {
+      "primary": "#F3F4F6",
+      "secondary": "#9CA3AF",
+      "tertiary": "#6B7280"
+    },
+    "accents": {
+      "allow": "#00E5FF",
+      "block": "#FF3366",
+      "escalate": "#FFB800",
+      "modify": "#8B5CF6",
+      "primary": "#FFFFFF"
+    }
+  },
+  "visual_enhancers": {
+    "glassmorphism": "Avoid muddy glass. Use solid surface_100 with 1px border-white/10.",
+    "glow": "Subtle text-shadow or box-shadow with accent colors for 'Allow' or 'Block' badges.",
+    "borders": "Expose the skeleton. Data heavy dashboards use subtle borders (border-white/10) to define areas without shadows."
+  },
+  "grids_and_layouts": {
+    "dashboard": "High Density Grid. grid-cols-1 md:grid-cols-3 lg:grid-cols-4. gap-4 or gap-6.",
+    "spacing": "Tight inner padding (p-4 to p-6) for cards, generous outer padding for page (p-8).",
+    "alignment": "Optical alignment. Left-align dense data, right-align numbers/metrics."
+  },
+  "components": {
+    "cards": "Flat background (surface_100), 1px border-white/10, no shadow. Hover: slight lift, border-white/20.",
+    "buttons": "Primary: white background, black text. Secondary: surface_100 background, white text, 1px border-white/10.",
+    "badges": "Translucent background (accent/10) + opaque text (accent). Example: bg-cyan-500/10 text-cyan-400.",
+    "inputs": "surface_100 background, border-white/10. Focus: ring-1 ring-white/20."
+  },
+  "motion": {
+    "transitions": "Fast and snappy. transition-colors duration-200.",
+    "live_feed": "Use framer-motion to slide in new decisions in the Runtime Decision Engine feed."
+  },
+  "accessibility": {
+    "contrast": "Ensure text contrast meets WCAG AA (4.5:1). Dark mode text should be off-white (#E5E7EB) not pure white to reduce astigmatism glare.",
+    "focus": "Mandatory focus rings on all interactive elements (focus:ring-2 focus:ring-white/20)."
+  },
+  "image_urls": [
+    {
+      "category": "auth_background",
+      "url": "https://images.pexels.com/photos/7641124/pexels-photo-7641124.jpeg",
+      "description": "Dark abstract textile/mesh texture for the auth page background."
+    },
+    {
+      "category": "agent_logo",
+      "url": "https://images.pexels.com/photos/15863044/pexels-photo-15863044.jpeg",
+      "description": "OpenAI logo for AI Agent integration."
+    },
+    {
+      "category": "user_avatar",
+      "url": "https://images.pexels.com/photos/20157010/pexels-photo-20157010.jpeg",
+      "description": "Professional avatar for the top right profile dropdown."
+    }
+  ],
+  "instructions_to_main_agent": [
+    "Build a Next-level Enterprise Dashboard with React and Tailwind CSS for .js files.",
+    "Use Phosphor Icons or Lucide-React for all icons, keeping a minimal technical aesthetic.",
+    "Ensure 'Runtime Decision Engine' includes a live streaming feed (simulated with setTimeout or setInterval) that displays Allow/Block decisions sliding in.",
+    "For the 'Policy Builder', implement a clean visual rule composer using a stacked card layout.",
+    "Include a 'Traffic Simulator' button that injects 5-10 fake requests to populate the feed and update KPI charts.",
+    "Do NOT use HTML native date/select. Use Shadcn UI logic but style it heavily according to these dark-mode guidelines.",
+    "Charts (Recharts): Use dark theme tooltips, remove cartesian grid lines or make them highly transparent (stroke='rgba(255,255,255,0.05)'), use thin bright lines."
+  ],
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [
+    "You tend to converge toward generic outputs. Avoid this: make creative, distinctive frontends that surprise and delight.",
+    "Use 1px borders (border-white/10) to separate components instead of shadows, which disappear in dark mode.",
+    "Never center align the app container. Do not add `.App { text-align: center; }`.",
+    "Every interaction needs micro-animations - hover states, focus states, and entrance animations.",
+    "Add 'data-testid' attributes to all key elements for testing.",
+    "Use sonner for toast notifications.",
+    "Do not use transparent backgrounds on dropdowns or floating elements. Use a solid background (`#111`) with a border (`border-white/10`)."
+  ]
+}
