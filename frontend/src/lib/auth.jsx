@@ -37,7 +37,10 @@ export function AuthProvider({ children }) {
   const logout = async () => {
     try {
       await api.post("/auth/logout");
-    } catch {}
+    } catch (err) {
+      // Non-fatal: the server-side session may already be gone.
+      console.warn("Logout request failed", err);
+    }
     localStorage.removeItem("gov_token");
     setUser(false);
   };

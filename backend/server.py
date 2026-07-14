@@ -261,7 +261,9 @@ async def update_agent(agent_id: str, body: AgentIn, user=Depends(get_current_us
 
 @api.delete("/agents/{agent_id}")
 async def delete_agent(agent_id: str, user=Depends(get_current_user)):
-    await db.agents.delete_one({"id": agent_id, "org_id": user["org_id"]})
+    r = await db.agents.delete_one({"id": agent_id, "org_id": user["org_id"]})
+    if not r.deleted_count:
+        raise HTTPException(404, "Agent not found")
     return {"ok": True}
 
 
@@ -297,7 +299,9 @@ async def update_policy(policy_id: str, body: PolicyIn, user=Depends(get_current
 
 @api.delete("/policies/{policy_id}")
 async def delete_policy(policy_id: str, user=Depends(get_current_user)):
-    await db.policies.delete_one({"id": policy_id, "org_id": user["org_id"]})
+    r = await db.policies.delete_one({"id": policy_id, "org_id": user["org_id"]})
+    if not r.deleted_count:
+        raise HTTPException(404, "Policy not found")
     return {"ok": True}
 
 

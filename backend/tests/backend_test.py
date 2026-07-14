@@ -163,9 +163,9 @@ class TestAgents:
         # new user cannot GET admin's agent
         r = new_user_session.get(f"{API}/agents/{admin_agent_id}")
         assert r.status_code == 404
-        # new user cannot DELETE admin's agent (silent no-op, verify admin still has it)
+        # new user cannot DELETE admin's agent (returns 404, admin still has it)
         r = new_user_session.delete(f"{API}/agents/{admin_agent_id}")
-        assert r.status_code == 200
+        assert r.status_code == 404
         r = admin_session.get(f"{API}/agents/{admin_agent_id}")
         assert r.status_code == 200, "cross-tenant delete leaked!"
 

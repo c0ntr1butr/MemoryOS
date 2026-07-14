@@ -170,7 +170,10 @@ export default function AuthPage() {
               disabled={loading}
               className="btn-primary w-full mt-6 flex items-center justify-center gap-2 disabled:opacity-60"
             >
-              {loading ? "…" : mode === "login" ? "Sign in" : "Create account"}
+              {(() => {
+                if (loading) return "…";
+                return mode === "login" ? "Sign in" : "Create account";
+              })()}
               <ArrowRight size={16} />
             </button>
           </form>

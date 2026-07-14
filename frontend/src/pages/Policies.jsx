@@ -48,6 +48,15 @@ export default function Policies() {
     load();
   }, [load]);
 
+  const normalizeConditionValue = (c) => {
+    if (c.op === "gt" || c.op === "lt") return Number(c.value);
+    if (c.op === "in" || c.op === "not_in")
+      return String(c.value)
+        .split(",")
+        .map((x) => x.trim());
+    return c.value;
+  };
+
   const submit = async (e) => {
     e.preventDefault();
     setSaving(true);
@@ -57,14 +66,7 @@ export default function Policies() {
         priority: Number(form.priority),
         conditions: form.conditions.map((c) => ({
           ...c,
-          value:
-            c.op === "gt" || c.op === "lt"
-              ? Number(c.value)
-              : c.op === "in" || c.op === "not_in"
-                ? String(c.value)
-                    .split(",")
-                    .map((x) => x.trim())
-                : c.value,
+          value: normalizeConditionValue(c),
         })),
       };
       await api.post("/policies", payload);
@@ -96,7 +98,7 @@ export default function Policies() {
       ...form,
       conditions: [
         ...form.conditions,
-        { field: "risk_score", op: "gt", value: 60 },
+        { _uid: crypto.randomUUID(), field: "risk_score", op: "gt", value: 60 },
       ],
     });
 
@@ -331,7 +333,7 @@ export default function Policies() {
                 </div>
               )}
               {form.conditions.map((c, i) => (
-                <div key={i} className="grid grid-cols-12 gap-2 items-center">
+                <div key={c._uid || i} className="grid grid-cols-12 gap-2 items-center">
                   <select
                     className="select col-span-3"
                     value={c.field}
