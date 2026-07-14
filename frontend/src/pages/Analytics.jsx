@@ -25,10 +25,15 @@ const COLORS = {
 
 export default function Analytics() {
   const [data, setData] = useState(null);
+  const [heat, setHeat] = useState(null);
 
   const load = useCallback(async () => {
-    const { data } = await api.get("/analytics/overview");
-    setData(data);
+    const [{ data: ov }, { data: hm }] = await Promise.all([
+      api.get("/analytics/overview"),
+      api.get("/analytics/heatmap"),
+    ]);
+    setData(ov);
+    setHeat(hm);
   }, []);
   useEffect(() => {
     load();
@@ -237,6 +242,84 @@ export default function Analytics() {
           </div>
         </div>
       </div>
+
+      {/* Risk heatmap */}
+      {heat && (
+        <div className="surface rounded-xl p-5 mt-4">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <div className="text-[11px] uppercase tracking-wider text-neutral-500 font-mono-plex">
+                Risk heatmap
+              </div>
+              <div className="font-display text-xl mt-1">Resource × action</div>
+            </div>
+            <div className="text-xs text-neutral-500 font-mono-plex">
+              cell = avg risk · shade = volume
+            </div>
+          </div>
+          {heat.resources.length === 0 ? (
+            <div className="text-neutral-500 text-sm py-8 text-center">
+              No traffic yet — inject some to populate the heatmap.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr>
+                    <th className="text-left p-2 text-[11px] uppercase tracking-wider text-neutral-500 font-mono-plex"></th>
+                    {heat.actions.map((a) => (
+                      <th
+                        key={a}
+                        className="text-center p-2 text-[11px] uppercase tracking-wider text-neutral-500 font-mono-plex"
+                      >
+                        {a}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {heat.resources.map((r) => (
+                    <tr key={r}>
+                      <td className="p-2 font-mono-plex text-[12.5px] text-neutral-300 whitespace-nowrap pr-4">
+                        {r}
+                      </td>
+                      {heat.actions.map((a) => {
+                        const cell =
+                          heat.cells.find((c) => c.resource === r && c.action === a) || {
+                            count: 0,
+                            avg_risk: 0,
+                          };
+                        const risk = cell.avg_risk;
+                        const alpha = Math.min(0.7, 0.08 + (cell.count / 40));
+                        const color =
+                          risk >= 70
+                            ? `rgba(255, 51, 102, ${alpha})`
+                            : risk >= 40
+                            ? `rgba(255, 184, 0, ${alpha})`
+                            : `rgba(0, 229, 255, ${alpha})`;
+                        return (
+                          <td key={a} className="p-1">
+                            <div
+                              className="h-14 rounded-md border hairline flex flex-col items-center justify-center transition-colors"
+                              style={{ background: color }}
+                              title={`avg risk ${risk} · ${cell.count} decisions`}
+                            >
+                              <div className="font-display text-lg leading-none">{risk || "·"}</div>
+                              <div className="text-[10px] text-neutral-500 font-mono-plex mt-1">
+                                {cell.count}
+                              </div>
+                            </div>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
     </PageWrap>
   );
 }

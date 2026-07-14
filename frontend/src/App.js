@@ -12,6 +12,13 @@ import AuditLogs from "@/pages/AuditLogs";
 import Analytics from "@/pages/Analytics";
 import Escalations from "@/pages/Escalations";
 import Settings from "@/pages/Settings";
+import ApiKeys from "@/pages/ApiKeys";
+import Connectors from "@/pages/Connectors";
+import Webhooks from "@/pages/Webhooks";
+import Members from "@/pages/Members";
+import Compliance from "@/pages/Compliance";
+import SDKs from "@/pages/SDKs";
+import Architecture from "@/pages/Architecture";
 
 function Protected({ children }) {
   const { user } = useAuth();
@@ -58,6 +65,13 @@ function App() {
               <Route path="audit" element={<AuditLogs />} />
               <Route path="analytics" element={<Analytics />} />
               <Route path="escalations" element={<Escalations />} />
+              <Route path="keys" element={<ApiKeys />} />
+              <Route path="connectors" element={<Connectors />} />
+              <Route path="webhooks" element={<Webhooks />} />
+              <Route path="members" element={<Members />} />
+              <Route path="compliance" element={<Compliance />} />
+              <Route path="sdks" element={<SDKs />} />
+              <Route path="architecture" element={<Architecture />} />
               <Route path="settings" element={<Settings />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />

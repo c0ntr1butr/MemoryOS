@@ -1,0 +1,50 @@
+{
+  "summary": "V2/V3 verification of MemoryGate rebrand. Backend: 23/23 regression + 34/35 new tests pass. Frontend: rebrand OK, all 15 sidebar nav items and 7 new routes render, SDKs playground returns a decision, Compliance framework switching + export button work, Runtime drawer displays 'Evaluation trace' with match/skip badges, API keys create + copy-secret UI works. Single real bug found: RBAC not enforced on POST /api/policies (viewers can create policies).",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "POST /api/policies", "issue": "Missing require_role('editor') guard — a 'viewer' can successfully create policies (test returned 200, spec expects 403). Same gap likely applies to PATCH /policies/{id}, DELETE /policies/{id}, POST /agents, PATCH /agents/{id}, DELETE /agents/{id}, POST /escalations/{id}/decide. Only V2 routes (api-keys, webhooks, connectors, members) currently use require_role. This breaks the RBAC promise of the platform.", "priority": "HIGH"}
+    ],
+    "minor": [
+      {"endpoint": "DELETE /api/agents/{id}, DELETE /api/policies/{id}", "issue": "Silent no-op when id belongs to another tenant (returns 404 correctly since query is scoped by org_id, so isolation is intact — carryover note from iteration_1)."},
+      {"endpoint": "POST /api/webhooks/{id}/test", "issue": "Returns HTTP 200 with {ok:false,status:0} when URL is unreachable — behaves as spec'd (fails gracefully). No issue, just noting for completeness."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Overview / Recharts ResponsiveContainer", "issue": "Repeats width(-1)/height(-1) console warning during initial layout — cosmetic, carryover from iteration_1.", "selector": "src/pages/Overview.jsx AreaChart", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/backend_test_v2.py",
+    "/app/test_reports/pytest/pytest_v2_results.xml"
+  ],
+  "action_items": [
+    "Add role guards to policy & agent mutation endpoints: change POST/PATCH/DELETE /api/policies and POST/PATCH/DELETE /api/agents to use `user=Depends(require_role('editor'))` so that viewers get 403. Same for POST /api/escalations/{id}/decide (probably editor+).",
+    "Optional: return 429-aware messaging on the AuthPage so users know they hit the rate limit (during heavy test runs the 20/min /api/auth/* window is reached quickly).",
+    "Cosmetic: set minHeight on Recharts ResponsiveContainer to silence width/height(-1) warnings."
+  ],
+  "critical_code_review_comments": [
+    "RBAC layer is inconsistent: require_role is only wired to the new V2 endpoints. Legacy resource mutations (agents, policies, escalations decide) are open to viewers — this is the single biggest gap.",
+    "server.py is now ~1550 lines with V2 appended below the router include. Consider splitting into routers/*.py (auth, agents, policies, evaluate, analytics, api_keys, webhooks, connectors, members, policy_versions, compliance, heatmap, ws) — the file is now well past the 700-line guideline.",
+    "InviteIn schema requires `password` in plain body — production-grade platforms usually issue an invitation token instead. Current design is fine for internal seeding but flag before GA.",
+    "Rollback creates a snapshot of the current version but then overwrites `_id` handling via pop — safe, verified. Version numbering increments correctly (rollback from v3→v1 produces v4).",
+    "WebSocket auth uses a raw JWT in query string — that leaks into access logs. Consider Sec-WebSocket-Protocol or subprotocol auth in a follow-up.",
+    "compliance_export.csv reuses compliance_report() by calling it directly — great DRY. CSV header row exists, escaping of quotes in control names is naive (only wraps 'name' in quotes, no doubling); low risk today since names are static.",
+    "_deliver_webhooks and _ws_broadcast are fire-and-forget via asyncio.create_task — good, but a burst of decisions from /simulate could create hundreds of pending tasks. Consider bounded task queue in future.",
+    "test_connector('mongodb') opens an AsyncIOMotorClient and closes synchronously via .close() — that's fine, but no await; consider `tmp.close()` is sync in motor 3.x, still ok.",
+    "Rate limiter (60s/20 for /api/auth/*) trips easily during automated end-to-end runs. Bumping to 40 or adding IP-allowlist for internal ranges would prevent CI flakiness."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test_v2.py"
+  ],
+  "success_rate": {"backend": "98.3% (57/58 — 23/23 regression + 34/35 V2)", "frontend": "100% (rebrand + 7 new routes + SDKs playground + Compliance switching + Runtime evaluation trace + ApiKeys create)"},
+  "test_credentials": "admin@sentinel.ai / Admin@2026 (seeded, verified via /auth/login). Additional users are created dynamically per fixture with TEST_ prefix.",
+  "seed_data_creation": "Tests create TEST_-prefixed api-keys, webhooks, connectors, members, and policies. Test artifacts remain in DB (no auto-teardown for API keys / connectors / webhooks / members).",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "V2 tests live at /app/backend/tests/backend_test_v2.py. Runs in ~4.5s with xdist. The failing test (TestMembers::test_viewer_cannot_create_policy) is a REAL bug in server.py — POST /api/policies is missing require_role('editor'). After main agent adds guards, re-run just that test to confirm. Beware of /api/auth/* rate limit (20 req/60s) — repeated login-in-fixture cycles during UI + backend runs can 429; wait ~60s between full sweeps or bump the limit in dev. Browser tests must use exact testids: auth-email-input, auth-password-input, auth-submit-button (NOT the shorter forms). All 15 nav-* testids, 7 new routes, and every V2 page testid (new-key-button, key-name-input, key-save-button, copy-secret-button, fw-{soc2/iso27001/gdpr/hipaa}, control-list, compliance-export-button, playground-run, playground-result, inject-many-button, decision-row-*, architecture-header) verified present and wired.",
+  "rca of the issue": "POST /api/policies uses `user=Depends(get_current_user)` instead of `Depends(require_role('editor'))`. Fix: change the dependency in create_policy, update_policy, delete_policy, and analogous agent endpoints. Reproduce: create a viewer via POST /api/members {role:'viewer'}, login, POST /api/policies → currently returns 200; should be 403."
+}

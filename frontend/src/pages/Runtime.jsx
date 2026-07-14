@@ -1,8 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import api from "@/lib/api";
+import api, { API } from "@/lib/api";
 import { PageHeader, PageWrap, DecisionBadge } from "@/components/ui-lib";
 import { toast } from "sonner";
-import { Zap, Play, Pause } from "lucide-react";
+import { Zap, Play, Pause, Radio } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 
 export default function Runtime() {
@@ -11,6 +11,7 @@ export default function Runtime() {
   const [live, setLive] = useState(true);
   const [filter, setFilter] = useState("all");
   const [busy, setBusy] = useState(false);
+  const [wsOk, setWsOk] = useState(false);
   const seenIds = useRef(new Set());
 
   const load = useCallback(async () => {
@@ -38,6 +39,38 @@ export default function Runtime() {
     const t = setInterval(load, 4000);
     return () => clearInterval(t);
   }, [live, load]);
+
+  // Real-time WebSocket subscription
+  useEffect(() => {
+    if (!live) return;
+    const token = localStorage.getItem("gov_token");
+    if (!token) return;
+    const wsUrl = API.replace(/^http/, "ws") + `/ws/decisions?token=${token}`;
+    let ws;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch {
+      return;
+    }
+    ws.onopen = () => setWsOk(true);
+    ws.onclose = () => setWsOk(false);
+    ws.onerror = () => setWsOk(false);
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type !== "decision") return;
+        const d = msg.data;
+        if (filter !== "all" && d.decision !== filter) return;
+        if (seenIds.current.has(d.id)) return;
+        seenIds.current.add(d.id);
+        d._isNew = true;
+        setItems((prev) => [d, ...prev].slice(0, 80));
+      } catch {}
+    };
+    return () => {
+      try { ws.close(); } catch {}
+    };
+  }, [live, filter]);
 
   const simulate = async (count) => {
     setBusy(true);
@@ -106,11 +139,20 @@ export default function Runtime() {
         ))}
         {live && (
           <div className="ml-auto flex items-center gap-2 text-xs text-neutral-500 font-mono-plex">
-            <span
-              className="dot pulse-dot text-cyan-300"
-              style={{ background: "#00e5ff" }}
-            />
-            live
+            {wsOk ? (
+              <>
+                <Radio size={11} className="text-cyan-300" />
+                <span className="text-cyan-300">ws live</span>
+              </>
+            ) : (
+              <>
+                <span
+                  className="dot pulse-dot text-cyan-300"
+                  style={{ background: "#00e5ff" }}
+                />
+                polling
+              </>
+            )}
           </div>
         )}
       </div>
@@ -189,6 +231,42 @@ export default function Runtime() {
                 <Field k="Policy" v={selected.policy_name} span={2} />
                 <Field k="Reason" v={selected.reason} span={2} />
               </div>
+
+              {/* Explainability trace */}
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-neutral-500 font-mono-plex mb-2 flex items-center gap-2">
+                  Evaluation trace
+                  <span className="text-neutral-600">— why this decision</span>
+                </div>
+                <div className="space-y-1.5">
+                  {(selected.evaluation_trace || []).map((t, i) => (
+                    <div
+                      key={i}
+                      className={`flex gap-2 items-start p-2 rounded-md border hairline text-[12px] ${
+                        t.matched ? "bg-cyan-500/[0.03]" : "bg-black/20"
+                      }`}
+                    >
+                      <span
+                        className={`badge ${t.matched ? "badge-allow" : "badge-muted"} !text-[9.5px]`}
+                      >
+                        {t.matched ? "match" : "skip"}
+                      </span>
+                      <div className="flex-1">
+                        <div className="font-mono-plex text-neutral-300">{t.step}</div>
+                        <div className="text-neutral-500 text-[11.5px] mt-0.5">
+                          {t.detail}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                  {!selected.evaluation_trace?.length && (
+                    <div className="text-xs text-neutral-500 italic">
+                      No trace on legacy decisions — inject new traffic to see the full engine walk-through.
+                    </div>
+                  )}
+                </div>
+              </div>
+
               <div>
                 <div className="text-[10px] uppercase tracking-wider text-neutral-500 font-mono-plex mb-2">
                   Payload

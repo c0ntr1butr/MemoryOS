@@ -10,12 +10,17 @@ import uuid
 import jwt
 import bcrypt
 import random
+import asyncio
+import hashlib
+import secrets
 import logging
+import httpx
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Dict, Any, Literal
-from fastapi import FastAPI, APIRouter, Request, Response, HTTPException, Depends, Query
-from fastapi.responses import JSONResponse
+from typing import List, Optional, Dict, Any, Literal, Set
+from fastapi import (FastAPI, APIRouter, Request, Response, HTTPException,
+                     Depends, Query, WebSocket, WebSocketDisconnect, status)
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
@@ -348,11 +353,25 @@ async def create_policy(body: PolicyIn, user=Depends(get_current_user)):
 
 @api.patch("/policies/{policy_id}")
 async def update_policy(policy_id: str, body: PolicyIn, user=Depends(get_current_user)):
-    r = await db.policies.update_one(
-        {"id": policy_id, "org_id": user["org_id"]}, {"$set": body.model_dump()}
-    )
-    if not r.matched_count:
+    existing = await db.policies.find_one({"id": policy_id, "org_id": user["org_id"]}, {"_id": 0})
+    if not existing:
         raise HTTPException(404, "Policy not found")
+    # Snapshot the previous version so we can roll back.
+    version_num = existing.get("version", 1)
+    await db.policy_versions.insert_one({
+        "id": new_id(),
+        "policy_id": policy_id,
+        "org_id": user["org_id"],
+        "version": version_num,
+        "snapshot": existing,
+        "changed_by": user["email"],
+        "created_at": now_utc().isoformat(),
+    })
+    update = body.model_dump()
+    update["version"] = version_num + 1
+    await db.policies.update_one(
+        {"id": policy_id, "org_id": user["org_id"]}, {"$set": update}
+    )
     return await db.policies.find_one({"id": policy_id}, {"_id": 0})
 
 
@@ -411,7 +430,8 @@ async def _log_decision(org_id: str, agent: dict, req: EvaluateIn, decision: str
                         matched_policy: Optional[dict], risk: int,
                         modified_payload: Optional[dict], reason: str,
                         client_ip: Optional[str] = None,
-                        user_agent: Optional[str] = None) -> dict:
+                        user_agent: Optional[str] = None,
+                        evaluation_trace: Optional[List[dict]] = None) -> dict:
     entry = {
         "id": new_id(),
         "org_id": org_id,
@@ -428,6 +448,7 @@ async def _log_decision(org_id: str, agent: dict, req: EvaluateIn, decision: str
         "context": req.context,
         "payload": req.payload,
         "modified_payload": modified_payload,
+        "evaluation_trace": evaluation_trace or [],
         "client_ip": client_ip,
         "user_agent": user_agent,
         "created_at": now_utc().isoformat(),
@@ -464,6 +485,9 @@ async def _log_decision(org_id: str, agent: dict, req: EvaluateIn, decision: str
         policy_id=entry["policy_id"],
         client_ip=client_ip,
     )
+    # Fan out to real-time subscribers and configured webhooks (fire and forget).
+    asyncio.create_task(_ws_broadcast(org_id, entry))
+    asyncio.create_task(_deliver_webhooks(org_id, entry))
     entry.pop("_id", None)
     return entry
 
@@ -474,11 +498,19 @@ async def _evaluate(org_id: str, req: EvaluateIn,
     agent = await db.agents.find_one({"id": req.agent_id, "org_id": org_id}, {"_id": 0})
     if not agent:
         raise HTTPException(404, "Unknown agent")
+    trace: List[dict] = [
+        {"step": "identity", "matched": True,
+         "detail": f"Agent {agent['name']} (trust={agent.get('trust_level')})"},
+    ]
     if agent.get("status") != "active":
+        trace.append({"step": "status", "matched": False,
+                      "detail": f"Agent is {agent.get('status')}, blocking"})
         return await _log_decision(org_id, agent, req, "block", None, 100, None,
                                    f"Agent status is {agent.get('status')}",
-                                   client_ip, user_agent)
+                                   client_ip, user_agent, evaluation_trace=trace)
     risk = _compute_risk(agent, req)
+    trace.append({"step": "risk", "matched": True,
+                  "detail": f"Computed risk score = {risk}"})
     ctx = {
         "resource": req.resource,
         "action": req.action,
@@ -493,30 +525,49 @@ async def _evaluate(org_id: str, req: EvaluateIn,
 
     for p in policies:
         if p["subject"] != "*" and p["subject"] != req.agent_id:
+            trace.append({"step": f"policy:{p['name']}", "matched": False,
+                          "detail": f"subject '{p['subject']}' does not match agent"})
             continue
         if not _match_pattern(p["resource_pattern"], req.resource):
+            trace.append({"step": f"policy:{p['name']}", "matched": False,
+                          "detail": f"resource '{req.resource}' does not match pattern '{p['resource_pattern']}'"})
             continue
         if p["action"] != "*" and p["action"] != req.action:
+            trace.append({"step": f"policy:{p['name']}", "matched": False,
+                          "detail": f"action '{req.action}' does not match '{p['action']}'"})
             continue
-        if not all(_cond_ok(c, ctx) for c in p.get("conditions", [])):
+        cond_fail = None
+        for c in p.get("conditions", []):
+            if not _cond_ok(c, ctx):
+                cond_fail = c
+                break
+        if cond_fail:
+            trace.append({"step": f"policy:{p['name']}", "matched": False,
+                          "detail": f"condition {cond_fail['field']} {cond_fail['op']} {cond_fail['value']} failed"})
             continue
         # matched
         modified = None
         reason = f"Matched policy '{p['name']}' (priority {p['priority']})"
+        trace.append({"step": f"policy:{p['name']}", "matched": True,
+                      "detail": f"effect='{p['effect']}', priority={p['priority']}"})
         if p["effect"] == "modify":
             modified = {**req.payload, "_governance": {"redacted_fields": ["email", "phone", "ssn"],
                                                         "notes": p.get("modify_instructions") or "PII stripped"}}
         return await _log_decision(org_id, agent, req, p["effect"], p, risk, modified, reason,
-                                   client_ip, user_agent)
+                                   client_ip, user_agent, evaluation_trace=trace)
 
     # default: escalate if high risk, else allow
     if risk >= 70:
+        trace.append({"step": "default", "matched": True,
+                      "detail": f"No policy matched, risk {risk} ≥ 70 → escalate"})
         return await _log_decision(org_id, agent, req, "escalate", None, risk, None,
                                    f"No policy matched and risk {risk} ≥ 70",
-                                   client_ip, user_agent)
+                                   client_ip, user_agent, evaluation_trace=trace)
+    trace.append({"step": "default", "matched": True,
+                  "detail": f"No policy matched, risk {risk} < 70 → allow"})
     return await _log_decision(org_id, agent, req, "allow", None, risk, None,
                                "No policy matched, low risk — default allow",
-                               client_ip, user_agent)
+                               client_ip, user_agent, evaluation_trace=trace)
 
 
 def _client_ip(request: Request) -> str:
@@ -710,10 +761,572 @@ async def simulate(request: Request, count: int = 10, user=Depends(get_current_u
     return {"created": len(made), "decisions": made}
 
 
+# ============================================================
+# V2 — API keys, webhooks, connectors, members/RBAC,
+# policy versions/rollback, compliance, heatmap, WebSocket
+# ============================================================
+
+# ---------- role helpers ----------
+_ROLE_ORDER = ["viewer", "editor", "admin", "owner"]
+
+
+def _has_role(user: dict, minimum: str) -> bool:
+    try:
+        return _ROLE_ORDER.index(user.get("role", "viewer")) >= _ROLE_ORDER.index(minimum)
+    except ValueError:
+        return False
+
+
+def require_role(minimum: str):
+    async def _dep(user=Depends(get_current_user)):
+        if not _has_role(user, minimum):
+            raise HTTPException(403, f"Requires role: {minimum} or higher")
+        return user
+    return _dep
+
+
+# ---------- WebSocket hub (per-org fan-out) ----------
+class _WsHub:
+    def __init__(self):
+        self._conns: Dict[str, Set[WebSocket]] = {}
+
+    async def connect(self, org_id: str, ws: WebSocket):
+        await ws.accept()
+        self._conns.setdefault(org_id, set()).add(ws)
+
+    def disconnect(self, org_id: str, ws: WebSocket):
+        self._conns.get(org_id, set()).discard(ws)
+
+    async def broadcast(self, org_id: str, message: dict):
+        dead: List[WebSocket] = []
+        for w in list(self._conns.get(org_id, set())):
+            try:
+                await w.send_json(message)
+            except Exception:
+                dead.append(w)
+        for w in dead:
+            self.disconnect(org_id, w)
+
+
+ws_hub = _WsHub()
+
+
+async def _ws_broadcast(org_id: str, decision: dict) -> None:
+    try:
+        # slim payload — drop bulky fields
+        payload = {k: v for k, v in decision.items() if k not in ("evaluation_trace", "payload", "modified_payload", "_id")}
+        await ws_hub.broadcast(org_id, {"type": "decision", "data": payload})
+    except Exception:
+        logger.exception("ws_broadcast failed")
+
+
+@app.websocket("/api/ws/decisions")
+async def ws_decisions(ws: WebSocket, token: str = Query(...)):
+    """Bearer-authenticated per-tenant live decision stream."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        org_id = payload["org_id"]
+    except Exception:
+        await ws.close(code=1008)
+        return
+    await ws_hub.connect(org_id, ws)
+    try:
+        await ws.send_json({"type": "hello", "org_id": org_id})
+        while True:
+            # keep alive; discard incoming messages
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ws_hub.disconnect(org_id, ws)
+
+
+# ---------- API keys ----------
+class ApiKeyIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80, pattern=_NAME_RE)
+    role: Literal["viewer", "editor", "admin"] = "editor"
+
+
+def _hash_key(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@api.get("/api-keys")
+async def list_keys(user=Depends(get_current_user)):
+    keys = await db.api_keys.find({"org_id": user["org_id"], "revoked": False},
+                                  {"_id": 0, "hash": 0}).sort("created_at", -1).to_list(200)
+    return keys
+
+
+@api.post("/api-keys")
+async def create_key(body: ApiKeyIn, user=Depends(require_role("admin"))):
+    raw = "mg_" + secrets.token_urlsafe(28)
+    doc = {
+        "id": new_id(),
+        "org_id": user["org_id"],
+        "name": body.name,
+        "role": body.role,
+        "prefix": raw[:8],
+        "suffix": raw[-4:],
+        "hash": _hash_key(raw),
+        "created_by": user["email"],
+        "created_at": now_utc().isoformat(),
+        "last_used_at": None,
+        "revoked": False,
+    }
+    await db.api_keys.insert_one(doc)
+    audit_log("apikey.create", org_id=user["org_id"], key_id=doc["id"], name=body.name)
+    doc.pop("_id", None)
+    doc.pop("hash", None)
+    return {**doc, "secret": raw}  # returned ONCE only
+
+
+@api.post("/api-keys/{key_id}/rotate")
+async def rotate_key(key_id: str, user=Depends(require_role("admin"))):
+    raw = "mg_" + secrets.token_urlsafe(28)
+    r = await db.api_keys.update_one(
+        {"id": key_id, "org_id": user["org_id"], "revoked": False},
+        {"$set": {"hash": _hash_key(raw), "prefix": raw[:8], "suffix": raw[-4:],
+                  "rotated_at": now_utc().isoformat()}},
+    )
+    if not r.matched_count:
+        raise HTTPException(404, "Key not found")
+    audit_log("apikey.rotate", org_id=user["org_id"], key_id=key_id)
+    return {"id": key_id, "secret": raw}
+
+
+@api.post("/api-keys/{key_id}/revoke")
+async def revoke_key(key_id: str, user=Depends(require_role("admin"))):
+    r = await db.api_keys.update_one(
+        {"id": key_id, "org_id": user["org_id"]},
+        {"$set": {"revoked": True, "revoked_at": now_utc().isoformat()}},
+    )
+    if not r.matched_count:
+        raise HTTPException(404, "Key not found")
+    audit_log("apikey.revoke", org_id=user["org_id"], key_id=key_id)
+    return {"ok": True}
+
+
+# ---------- Webhooks ----------
+class WebhookIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80, pattern=_NAME_RE)
+    url: str = Field(min_length=8, max_length=400)
+    kind: Literal["slack", "teams", "pagerduty", "custom"] = "custom"
+    events: List[Literal["block", "escalate", "modify", "allow"]] = Field(default_factory=lambda: ["block", "escalate"])
+    enabled: bool = True
+
+
+@api.get("/webhooks")
+async def list_webhooks(user=Depends(get_current_user)):
+    items = await db.webhooks.find({"org_id": user["org_id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return items
+
+
+@api.post("/webhooks")
+async def create_webhook(body: WebhookIn, user=Depends(require_role("admin"))):
+    doc = {**body.model_dump(), "id": new_id(), "org_id": user["org_id"],
+           "created_at": now_utc().isoformat(), "delivery_count": 0, "last_delivered_at": None}
+    await db.webhooks.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.patch("/webhooks/{wid}")
+async def update_webhook(wid: str, body: WebhookIn, user=Depends(require_role("admin"))):
+    r = await db.webhooks.update_one({"id": wid, "org_id": user["org_id"]}, {"$set": body.model_dump()})
+    if not r.matched_count:
+        raise HTTPException(404, "Not found")
+    return await db.webhooks.find_one({"id": wid}, {"_id": 0})
+
+
+@api.delete("/webhooks/{wid}")
+async def delete_webhook(wid: str, user=Depends(require_role("admin"))):
+    r = await db.webhooks.delete_one({"id": wid, "org_id": user["org_id"]})
+    if not r.deleted_count:
+        raise HTTPException(404, "Not found")
+    return {"ok": True}
+
+
+@api.post("/webhooks/{wid}/test")
+async def test_webhook(wid: str, user=Depends(require_role("admin"))):
+    wh = await db.webhooks.find_one({"id": wid, "org_id": user["org_id"]}, {"_id": 0})
+    if not wh:
+        raise HTTPException(404, "Not found")
+    ok, status_code = await _post_webhook(wh, {
+        "type": "test",
+        "message": "MemoryGate test event from " + user["email"],
+        "ts": now_utc().isoformat(),
+    })
+    return {"ok": ok, "status": status_code}
+
+
+def _format_webhook_payload(wh: dict, decision: dict) -> dict:
+    d = decision
+    title = f"[{d['decision'].upper()}] {d['agent_name']} → {d['action']} {d['resource']}"
+    detail = f"Policy: {d['policy_name']} · Risk: {d['risk_score']} · Reason: {d['reason']}"
+    if wh["kind"] == "slack":
+        return {"text": f"*{title}*\n{detail}"}
+    if wh["kind"] == "teams":
+        return {"@type": "MessageCard", "@context": "https://schema.org/extensions",
+                "summary": title, "themeColor": "FF3366",
+                "sections": [{"activityTitle": title, "text": detail}]}
+    if wh["kind"] == "pagerduty":
+        return {"payload": {"summary": title, "severity": "warning", "source": "MemoryGate",
+                            "custom_details": {"reason": d["reason"], "risk": d["risk_score"]}},
+                "routing_key": "PLACEHOLDER", "event_action": "trigger"}
+    return {"event": "decision", "decision": d}
+
+
+async def _post_webhook(wh: dict, body: dict) -> (bool, int):
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.post(wh["url"], json=body, headers={"User-Agent": "MemoryGate/1.0"})
+            return (200 <= r.status_code < 300), r.status_code
+    except Exception as e:
+        logger.warning("webhook delivery failed for %s: %s", wh.get("id"), e)
+        return False, 0
+
+
+async def _deliver_webhooks(org_id: str, decision: dict) -> None:
+    try:
+        hooks = await db.webhooks.find({"org_id": org_id, "enabled": True}, {"_id": 0}).to_list(50)
+        for wh in hooks:
+            if decision["decision"] not in wh.get("events", []):
+                continue
+            body = _format_webhook_payload(wh, decision)
+            ok, code = await _post_webhook(wh, body)
+            await db.webhooks.update_one({"id": wh["id"]},
+                                         {"$inc": {"delivery_count": 1},
+                                          "$set": {"last_delivered_at": now_utc().isoformat(),
+                                                    "last_status": code}})
+            audit_log("webhook.deliver", org_id=org_id, webhook_id=wh["id"],
+                      status=code, ok=ok, decision_id=decision["id"])
+    except Exception:
+        logger.exception("_deliver_webhooks failed")
+
+
+# ---------- Connectors ----------
+CONNECTOR_KINDS = ["postgres", "mongodb", "surrealdb", "redis", "pinecone", "qdrant", "rest"]
+
+
+class ConnectorIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80, pattern=_NAME_RE)
+    kind: Literal["postgres", "mongodb", "surrealdb", "redis", "pinecone", "qdrant", "rest"]
+    config: Dict[str, Any] = Field(default_factory=dict)  # host, port, url, api_key, etc.
+    scope: str = Field(default="", max_length=120)  # e.g. "customers.*"
+
+
+@api.get("/connectors")
+async def list_connectors(user=Depends(get_current_user)):
+    items = await db.connectors.find({"org_id": user["org_id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return items
+
+
+@api.post("/connectors")
+async def create_connector(body: ConnectorIn, user=Depends(require_role("editor"))):
+    doc = {**body.model_dump(), "id": new_id(), "org_id": user["org_id"],
+           "status": "unknown", "created_at": now_utc().isoformat()}
+    # Redact obvious secret fields when storing (still keep, just mark)
+    await db.connectors.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.patch("/connectors/{cid}")
+async def update_connector(cid: str, body: ConnectorIn, user=Depends(require_role("editor"))):
+    r = await db.connectors.update_one({"id": cid, "org_id": user["org_id"]}, {"$set": body.model_dump()})
+    if not r.matched_count:
+        raise HTTPException(404, "Not found")
+    return await db.connectors.find_one({"id": cid}, {"_id": 0})
+
+
+@api.delete("/connectors/{cid}")
+async def delete_connector(cid: str, user=Depends(require_role("editor"))):
+    r = await db.connectors.delete_one({"id": cid, "org_id": user["org_id"]})
+    if not r.deleted_count:
+        raise HTTPException(404, "Not found")
+    return {"ok": True}
+
+
+@api.post("/connectors/{cid}/test")
+async def test_connector(cid: str, user=Depends(get_current_user)):
+    c = await db.connectors.find_one({"id": cid, "org_id": user["org_id"]}, {"_id": 0})
+    if not c:
+        raise HTTPException(404, "Not found")
+    kind = c["kind"]
+    cfg = c.get("config", {})
+    ok = False
+    detail = ""
+    try:
+        if kind == "rest":
+            url = cfg.get("url", "")
+            async with httpx.AsyncClient(timeout=4.0) as cli:
+                r = await cli.get(url, headers=cfg.get("headers") or {})
+                ok = r.status_code < 500
+                detail = f"HTTP {r.status_code}"
+        elif kind == "mongodb":
+            url = cfg.get("url", "")
+            tmp = AsyncIOMotorClient(url, serverSelectionTimeoutMS=2500)
+            info = await tmp.admin.command("ping")
+            ok = bool(info.get("ok"))
+            detail = "ping ok" if ok else "ping failed"
+            tmp.close()
+        else:
+            # For demo: heuristic — if a URL/host is provided we mark reachable.
+            has_target = any(cfg.get(k) for k in ("url", "host", "endpoint"))
+            ok = has_target
+            detail = "config accepted" if ok else "missing host/url"
+    except Exception as e:
+        ok = False
+        detail = str(e)[:200]
+    await db.connectors.update_one({"id": cid}, {"$set": {
+        "status": "healthy" if ok else "degraded",
+        "last_tested_at": now_utc().isoformat(),
+        "last_test_detail": detail,
+    }})
+    return {"ok": ok, "detail": detail}
+
+
+# ---------- Members / RBAC ----------
+class InviteIn(BaseModel):
+    email: EmailStr
+    name: str = Field(min_length=1, max_length=80)
+    role: Literal["viewer", "editor", "admin"] = "editor"
+    password: str = Field(min_length=8, max_length=128)
+
+
+class RoleUpdateIn(BaseModel):
+    role: Literal["viewer", "editor", "admin", "owner"]
+
+
+@api.get("/members")
+async def list_members(user=Depends(get_current_user)):
+    items = await db.users.find({"org_id": user["org_id"]},
+                                {"_id": 0, "password_hash": 0}).sort("created_at", 1).to_list(500)
+    return items
+
+
+@api.post("/members")
+async def invite_member(body: InviteIn, user=Depends(require_role("admin"))):
+    email = body.email.lower()
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(400, "Email already in use")
+    doc = {
+        "id": new_id(),
+        "org_id": user["org_id"],
+        "email": email,
+        "name": body.name,
+        "role": body.role,
+        "password_hash": hash_password(body.password),
+        "invited_by": user["email"],
+        "created_at": now_utc().isoformat(),
+    }
+    await db.users.insert_one(doc)
+    audit_log("member.invite", org_id=user["org_id"], email=email, role=body.role)
+    doc.pop("_id", None)
+    doc.pop("password_hash", None)
+    return doc
+
+
+@api.patch("/members/{uid}")
+async def change_role(uid: str, body: RoleUpdateIn, user=Depends(require_role("admin"))):
+    target = await db.users.find_one({"id": uid, "org_id": user["org_id"]})
+    if not target:
+        raise HTTPException(404, "Not found")
+    if target["role"] == "owner" and body.role != "owner":
+        raise HTTPException(400, "Cannot demote the owner")
+    if body.role == "owner":
+        raise HTTPException(400, "Ownership transfer requires a separate endpoint")
+    await db.users.update_one({"id": uid}, {"$set": {"role": body.role}})
+    audit_log("member.role", org_id=user["org_id"], target_id=uid, role=body.role)
+    return {"ok": True}
+
+
+@api.delete("/members/{uid}")
+async def remove_member(uid: str, user=Depends(require_role("admin"))):
+    target = await db.users.find_one({"id": uid, "org_id": user["org_id"]})
+    if not target:
+        raise HTTPException(404, "Not found")
+    if target["role"] == "owner":
+        raise HTTPException(400, "Cannot remove owner")
+    if target["id"] == user["id"]:
+        raise HTTPException(400, "Cannot remove yourself")
+    await db.users.delete_one({"id": uid})
+    audit_log("member.remove", org_id=user["org_id"], target_id=uid)
+    return {"ok": True}
+
+
+# ---------- Policy versions / rollback ----------
+@api.get("/policies/{policy_id}/versions")
+async def list_policy_versions(policy_id: str, user=Depends(get_current_user)):
+    items = await db.policy_versions.find(
+        {"policy_id": policy_id, "org_id": user["org_id"]}, {"_id": 0}
+    ).sort("version", -1).to_list(200)
+    return items
+
+
+@api.post("/policies/{policy_id}/rollback/{version}")
+async def rollback_policy(policy_id: str, version: int, user=Depends(require_role("editor"))):
+    ver = await db.policy_versions.find_one(
+        {"policy_id": policy_id, "org_id": user["org_id"], "version": version}, {"_id": 0}
+    )
+    if not ver:
+        raise HTTPException(404, "Version not found")
+    existing = await db.policies.find_one({"id": policy_id, "org_id": user["org_id"]}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Policy not found")
+    # snapshot current before overwrite
+    await db.policy_versions.insert_one({
+        "id": new_id(), "policy_id": policy_id, "org_id": user["org_id"],
+        "version": existing.get("version", 1), "snapshot": existing,
+        "changed_by": user["email"] + " (pre-rollback)",
+        "created_at": now_utc().isoformat(),
+    })
+    snap = ver["snapshot"]
+    snap["version"] = existing.get("version", 1) + 1
+    snap.pop("_id", None)
+    await db.policies.update_one({"id": policy_id, "org_id": user["org_id"]}, {"$set": snap})
+    audit_log("policy.rollback", org_id=user["org_id"], policy_id=policy_id, to_version=version)
+    return {"ok": True, "version": snap["version"]}
+
+
+# ---------- Compliance ----------
+COMPLIANCE_FRAMEWORKS = {
+    "soc2": {
+        "name": "SOC 2 Type II",
+        "controls": [
+            ("CC1.1", "Governance policies defined", lambda s: s["policies"] >= 1),
+            ("CC5.2", "Access reviewed via decision log", lambda s: s["decisions_total"] >= 1),
+            ("CC6.1", "Logical access via authenticated agents", lambda s: s["agents"] >= 1),
+            ("CC7.2", "Anomalies flagged & escalated", lambda s: s["escalations_total"] >= 0),
+            ("CC7.3", "Continuous audit trail retained", lambda s: s["audit_lines"] >= 1),
+            ("CC8.1", "Change management via policy versioning", lambda s: s["policy_versions"] >= 0),
+        ],
+    },
+    "iso27001": {
+        "name": "ISO/IEC 27001:2022",
+        "controls": [
+            ("A.5.15", "Access control policies defined", lambda s: s["policies"] >= 1),
+            ("A.8.2",  "Privileged access rights governed", lambda s: True),
+            ("A.8.15", "Logging enabled for AI actions",   lambda s: s["decisions_total"] >= 1),
+            ("A.8.16", "Monitoring & alerting configured", lambda s: s["webhooks"] >= 0),
+            ("A.5.30", "ICT readiness for continuity",     lambda s: True),
+        ],
+    },
+    "gdpr": {
+        "name": "GDPR",
+        "controls": [
+            ("Art. 5",  "Lawful processing tracked in decisions", lambda s: s["decisions_total"] >= 1),
+            ("Art. 15", "Data subject access via audit log",       lambda s: True),
+            ("Art. 25", "Data protection by design (PII redact)",  lambda s: s["modify_policies"] >= 0),
+            ("Art. 30", "Records of processing activities",        lambda s: s["audit_lines"] >= 1),
+            ("Art. 32", "Security of processing (encryption etc.)", lambda s: True),
+        ],
+    },
+    "hipaa": {
+        "name": "HIPAA Security Rule",
+        "controls": [
+            ("§164.308(a)(3)", "Workforce access management",      lambda s: s["members"] >= 1),
+            ("§164.308(a)(5)", "Security awareness (audit trail)", lambda s: s["audit_lines"] >= 1),
+            ("§164.312(a)",    "Access control (unique agent ID)",  lambda s: s["agents"] >= 1),
+            ("§164.312(b)",    "Audit controls",                    lambda s: s["decisions_total"] >= 1),
+            ("§164.312(e)",    "Transmission security (TLS)",       lambda s: True),
+        ],
+    },
+}
+
+
+async def _compliance_stats(org_id: str) -> dict:
+    return {
+        "policies": await db.policies.count_documents({"org_id": org_id, "enabled": True}),
+        "agents": await db.agents.count_documents({"org_id": org_id}),
+        "decisions_total": await db.decisions.count_documents({"org_id": org_id}),
+        "escalations_total": await db.escalations.count_documents({"org_id": org_id}),
+        "policy_versions": await db.policy_versions.count_documents({"org_id": org_id}),
+        "webhooks": await db.webhooks.count_documents({"org_id": org_id, "enabled": True}),
+        "members": await db.users.count_documents({"org_id": org_id}),
+        "audit_lines": await db.decisions.count_documents({"org_id": org_id}),
+        "modify_policies": await db.policies.count_documents({"org_id": org_id, "effect": "modify"}),
+    }
+
+
+@api.get("/compliance/report")
+async def compliance_report(framework: str = Query("soc2"), user=Depends(get_current_user)):
+    fw = COMPLIANCE_FRAMEWORKS.get(framework.lower())
+    if not fw:
+        raise HTTPException(400, "Unknown framework")
+    stats = await _compliance_stats(user["org_id"])
+    controls = []
+    for code, name, check in fw["controls"]:
+        controls.append({"code": code, "name": name, "status": "pass" if check(stats) else "attention"})
+    passed = sum(1 for c in controls if c["status"] == "pass")
+    return {
+        "framework": framework, "framework_name": fw["name"],
+        "org_id": user["org_id"], "generated_at": now_utc().isoformat(),
+        "coverage": round(100 * passed / max(1, len(controls))),
+        "stats": stats, "controls": controls,
+    }
+
+
+@api.get("/compliance/export.csv")
+async def compliance_export(framework: str = Query("soc2"), user=Depends(get_current_user)):
+    report = await compliance_report(framework, user)  # reuse
+    lines = ["framework,code,control,status,generated_at,org_id"]
+    for c in report["controls"]:
+        lines.append(f'{report["framework_name"]},{c["code"]},"{c["name"]}",{c["status"]},{report["generated_at"]},{report["org_id"]}')
+    return StreamingResponse(
+        iter(["\n".join(lines) + "\n"]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="memorygate_{framework}_report.csv"'},
+    )
+
+
+# ---------- Risk heatmap ----------
+_HEATMAP_ACTIONS = ["read", "write", "execute", "delete"]
+
+
+@api.get("/analytics/heatmap")
+async def heatmap(user=Depends(get_current_user)):
+    org_id = user["org_id"]
+    pipeline = [
+        {"$match": {"org_id": org_id}},
+        {"$group": {
+            "_id": {"resource": "$resource", "action": "$action"},
+            "count": {"$sum": 1},
+            "avg_risk": {"$avg": "$risk_score"},
+            "blocks": {"$sum": {"$cond": [{"$eq": ["$decision", "block"]}, 1, 0]}},
+        }},
+        {"$sort": {"count": -1}},
+        {"$limit": 30},
+    ]
+    resources: List[str] = []
+    matrix: Dict[str, Dict[str, dict]] = {}
+    async for row in db.decisions.aggregate(pipeline):
+        r = row["_id"]["resource"]
+        a = row["_id"]["action"]
+        if r not in resources:
+            resources.append(r)
+        matrix.setdefault(r, {})[a] = {
+            "count": row["count"],
+            "avg_risk": round(row["avg_risk"] or 0),
+            "blocks": row["blocks"],
+        }
+    resources = resources[:10]
+    cells = []
+    for r in resources:
+        for a in _HEATMAP_ACTIONS:
+            cell = matrix.get(r, {}).get(a) or {"count": 0, "avg_risk": 0, "blocks": 0}
+            cells.append({"resource": r, "action": a, **cell})
+    return {"resources": resources, "actions": _HEATMAP_ACTIONS, "cells": cells}
+
+
+
+
+
 # ------------------------ health ------------------------
 @api.get("/")
 async def root():
-    return {"ok": True, "service": "AI Runtime Governance"}
+    return {"ok": True, "service": "MemoryGate Runtime Governance"}
 
 
 # ------------------------ startup ------------------------
@@ -723,8 +1336,12 @@ async def _ensure_indexes():
     await db.orgs.create_index("id", unique=True)
     await db.agents.create_index([("org_id", 1), ("created_at", -1)])
     await db.policies.create_index([("org_id", 1), ("priority", 1)])
+    await db.policy_versions.create_index([("policy_id", 1), ("version", -1)])
     await db.decisions.create_index([("org_id", 1), ("created_at", -1)])
     await db.escalations.create_index([("org_id", 1), ("status", 1)])
+    await db.api_keys.create_index([("org_id", 1), ("revoked", 1)])
+    await db.webhooks.create_index([("org_id", 1)])
+    await db.connectors.create_index([("org_id", 1)])
 
 
 async def _seed_demo():

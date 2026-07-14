@@ -51,7 +51,7 @@ export default function AuthPage() {
               <Shield size={18} className="text-cyan-300" />
             </div>
             <div>
-              <div className="font-display text-lg">Sentinel</div>
+              <div className="font-display text-lg">MemoryGate</div>
               <div className="text-xs text-neutral-500 font-mono-plex -mt-0.5">
                 runtime.governance
               </div>
@@ -82,7 +82,7 @@ export default function AuthPage() {
             </div>
           </div>
           <div className="text-neutral-600 text-xs font-mono-plex">
-            © 2026 Sentinel Labs — governance @ runtime
+            © 2026 MemoryGate — governance @ runtime
           </div>
         </div>
       </div>
@@ -92,7 +92,7 @@ export default function AuthPage() {
         <div className="w-full max-w-md">
           <div className="lg:hidden flex items-center gap-2 mb-8">
             <Shield size={18} className="text-cyan-300" />
-            <div className="font-display text-xl">Sentinel</div>
+            <div className="font-display text-xl">MemoryGate</div>
           </div>
           <div className="mb-8">
             <div className="text-xs font-mono-plex text-neutral-500 uppercase tracking-wider">
