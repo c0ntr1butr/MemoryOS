@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useNavigate, Link } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/lib/auth";
 import { toast } from "sonner";
 import { Shield, Lock, ArrowRight } from "lucide-react";
@@ -16,9 +16,9 @@ export default function AuthPage() {
     org_name: "",
   });
 
-  if (user && user.email) {
-    navigate("/", { replace: true });
-  }
+  useEffect(() => {
+    if (user && user.email) navigate("/", { replace: true });
+  }, [user, navigate]);
 
   const onSubmit = async (e) => {
     e.preventDefault();
