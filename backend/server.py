@@ -156,6 +156,25 @@ async def get_current_user(request: Request) -> dict:
     return user
 
 
+# ---------- role helpers ----------
+_ROLE_ORDER = ["viewer", "editor", "admin", "owner"]
+
+
+def _has_role(user: dict, minimum: str) -> bool:
+    try:
+        return _ROLE_ORDER.index(user.get("role", "viewer")) >= _ROLE_ORDER.index(minimum)
+    except ValueError:
+        return False
+
+
+def require_role(minimum: str):
+    async def _dep(user=Depends(get_current_user)):
+        if not _has_role(user, minimum):
+            raise HTTPException(403, f"Requires role: {minimum} or higher")
+        return user
+    return _dep
+
+
 # ------------------------ models ------------------------
 _NAME_RE = r"^[A-Za-z0-9 _.\-]{1,80}$"
 _PATTERN_RE = r"^[A-Za-z0-9_.\-\*]{1,120}$"
@@ -290,7 +309,7 @@ async def list_agents(user=Depends(get_current_user)):
 
 
 @api.post("/agents")
-async def create_agent(body: AgentIn, user=Depends(get_current_user)):
+async def create_agent(body: AgentIn, user=Depends(require_role("editor"))):
     doc = body.model_dump()
     doc.update({
         "id": new_id(),
@@ -312,7 +331,7 @@ async def get_agent(agent_id: str, user=Depends(get_current_user)):
 
 
 @api.patch("/agents/{agent_id}")
-async def update_agent(agent_id: str, body: AgentIn, user=Depends(get_current_user)):
+async def update_agent(agent_id: str, body: AgentIn, user=Depends(require_role("editor"))):
     update = body.model_dump()
     r = await db.agents.update_one(
         {"id": agent_id, "org_id": user["org_id"]}, {"$set": update}
@@ -324,7 +343,7 @@ async def update_agent(agent_id: str, body: AgentIn, user=Depends(get_current_us
 
 
 @api.delete("/agents/{agent_id}")
-async def delete_agent(agent_id: str, user=Depends(get_current_user)):
+async def delete_agent(agent_id: str, user=Depends(require_role("editor"))):
     r = await db.agents.delete_one({"id": agent_id, "org_id": user["org_id"]})
     if not r.deleted_count:
         raise HTTPException(404, "Agent not found")
@@ -339,7 +358,7 @@ async def list_policies(user=Depends(get_current_user)):
 
 
 @api.post("/policies")
-async def create_policy(body: PolicyIn, user=Depends(get_current_user)):
+async def create_policy(body: PolicyIn, user=Depends(require_role("editor"))):
     doc = body.model_dump()
     doc.update({
         "id": new_id(),
@@ -352,7 +371,7 @@ async def create_policy(body: PolicyIn, user=Depends(get_current_user)):
 
 
 @api.patch("/policies/{policy_id}")
-async def update_policy(policy_id: str, body: PolicyIn, user=Depends(get_current_user)):
+async def update_policy(policy_id: str, body: PolicyIn, user=Depends(require_role("editor"))):
     existing = await db.policies.find_one({"id": policy_id, "org_id": user["org_id"]}, {"_id": 0})
     if not existing:
         raise HTTPException(404, "Policy not found")
@@ -376,7 +395,7 @@ async def update_policy(policy_id: str, body: PolicyIn, user=Depends(get_current
 
 
 @api.delete("/policies/{policy_id}")
-async def delete_policy(policy_id: str, user=Depends(get_current_user)):
+async def delete_policy(policy_id: str, user=Depends(require_role("editor"))):
     r = await db.policies.delete_one({"id": policy_id, "org_id": user["org_id"]})
     if not r.deleted_count:
         raise HTTPException(404, "Policy not found")
@@ -630,7 +649,7 @@ async def list_escalations(user=Depends(get_current_user),
 
 @api.post("/escalations/{esc_id}/decide")
 async def decide_escalation(esc_id: str, body: EscalationDecisionIn,
-                            user=Depends(get_current_user)):
+                            user=Depends(require_role("editor"))):
     esc = await db.escalations.find_one({"id": esc_id, "org_id": user["org_id"]})
     if not esc:
         raise HTTPException(404, "Not found")
@@ -765,25 +784,6 @@ async def simulate(request: Request, count: int = 10, user=Depends(get_current_u
 # V2 — API keys, webhooks, connectors, members/RBAC,
 # policy versions/rollback, compliance, heatmap, WebSocket
 # ============================================================
-
-# ---------- role helpers ----------
-_ROLE_ORDER = ["viewer", "editor", "admin", "owner"]
-
-
-def _has_role(user: dict, minimum: str) -> bool:
-    try:
-        return _ROLE_ORDER.index(user.get("role", "viewer")) >= _ROLE_ORDER.index(minimum)
-    except ValueError:
-        return False
-
-
-def require_role(minimum: str):
-    async def _dep(user=Depends(get_current_user)):
-        if not _has_role(user, minimum):
-            raise HTTPException(403, f"Requires role: {minimum} or higher")
-        return user
-    return _dep
-
 
 # ---------- WebSocket hub (per-org fan-out) ----------
 class _WsHub:
